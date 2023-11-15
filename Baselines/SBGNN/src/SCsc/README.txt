@@ -1,1 +1,0 @@
-python SCsc.py ../../data/dataset_training.txt ../../data/dataset_testing.txt

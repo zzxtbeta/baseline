@@ -67,6 +67,7 @@ def create_perspectives(edge_lists):
     edgelist_b_b_pos, edgelist_b_b_neg = defaultdict(list), defaultdict(list)
 
     for a, b, s in edge_lists:
+        # print(f's:{s}')
         if s == 1:
             edgelist_a_b_pos[a].append(b)
             edgelist_b_a_pos[b].append(a)

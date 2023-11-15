@@ -62,7 +62,7 @@ args = parser.parse_args()
 print(args)
 
 args.cuda = not args.no_cuda and torch.cuda.is_available()
-device = torch.device("cuda" if args.cuda else "cpu")
+device = torch.device("cuda:1" if args.cuda else "cpu")
 
 # torch.set_default_dtype(torch.float32)
 

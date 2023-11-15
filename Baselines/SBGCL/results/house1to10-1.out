@@ -1,0 +1,8 @@
+Namespace(alpha=0.8, augment='delete', beta=0.0005, dataset='house1to10-1', debug=False, dim_embs=32, dropout=0.5, epochs=2000, lr=0.005, mask_ratio=0.1, no_cuda=False, predictor='2-linear', seed=2023, tau=0.05)
+515 1797 114378
+Traceback (most recent call last):
+  File "train.py", line 96, in <module>
+    edgelist_b_b_pos, edgelist_b_b_neg = create_perspectives(train_edgelist) # defaultdict(list)
+  File "/home/yrgu/topic/baseline/Baselines/SBGCL/data_load.py", line 78, in create_perspectives
+    raise Exception("s must be -1/1")
+Exception: s must be -1/1
