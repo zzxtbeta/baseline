@@ -28,7 +28,7 @@ parser = argparse.ArgumentParser()
 
 parser.add_argument('--debug', action='store_true', default=False,
                     help='debug mode')
-parser.add_argument('--no-cuda', action='store_true', default=False,
+parser.add_argument('--no-cuda', action='store_true', default=True,
                     help='Disables CUDA training.')
 parser.add_argument('--dataset', type=str, default='review-1',
                     help='choose dataset')
@@ -62,7 +62,8 @@ args = parser.parse_args()
 print(args)
 
 args.cuda = not args.no_cuda and torch.cuda.is_available()
-device = torch.device("cuda:1" if args.cuda else "cpu")
+device = torch.device("cuda:0" if args.cuda else "cpu")
+# device = torch.device("cpu")
 
 # torch.set_default_dtype(torch.float32)
 
