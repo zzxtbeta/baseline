@@ -1,3 +1,4 @@
+sbgnn.py --lr 5e-3 --seed 2023 --dataset_name bitcoin_alpha-5 --gnn_layer 2 --epoch 2000 --agg AttentionAggregator
 #!/usr/bin/env python3
 #-*- coding: utf-8 -*-
 """
@@ -468,3 +469,60 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+====================
+SBGNN(
+  (features_a): Embedding(3783, 32)
+  (features_b): Embedding(3783, 32)
+  (layers): ModuleList(
+    (0-1): 2 x SBGNNLayer(
+      (agg_a_from_b_pos): AttentionAggregator(
+        (out_mlp_layer): Sequential(
+          (0): Linear(in_features=32, out_features=32, bias=True)
+        )
+      )
+      (agg_a_from_b_neg): AttentionAggregator(
+        (out_mlp_layer): Sequential(
+          (0): Linear(in_features=32, out_features=32, bias=True)
+        )
+      )
+      (agg_a_from_a_pos): AttentionAggregator(
+        (out_mlp_layer): Sequential(
+          (0): Linear(in_features=32, out_features=32, bias=True)
+        )
+      )
+      (agg_a_from_a_neg): AttentionAggregator(
+        (out_mlp_layer): Sequential(
+          (0): Linear(in_features=32, out_features=32, bias=True)
+        )
+      )
+      (agg_b_from_a_pos): AttentionAggregator(
+        (out_mlp_layer): Sequential(
+          (0): Linear(in_features=32, out_features=32, bias=True)
+        )
+      )
+      (agg_b_from_a_neg): AttentionAggregator(
+        (out_mlp_layer): Sequential(
+          (0): Linear(in_features=32, out_features=32, bias=True)
+        )
+      )
+      (agg_b_from_b_pos): AttentionAggregator(
+        (out_mlp_layer): Sequential(
+          (0): Linear(in_features=32, out_features=32, bias=True)
+        )
+      )
+      (agg_b_from_b_neg): AttentionAggregator(
+        (out_mlp_layer): Sequential(
+          (0): Linear(in_features=32, out_features=32, bias=True)
+        )
+      )
+      (update_func): Sequential(
+        (0): Dropout(p=0.5, inplace=False)
+        (1): Linear(in_features=160, out_features=64, bias=True)
+        (2): PReLU(num_parameters=1)
+        (3): Linear(in_features=64, out_features=32, bias=True)
+      )
+    )
+  )
+)
+  0%|          | 0/2001 [00:00<?, ?it/s]  0%|          | 1/2001 [00:12<6:57:30, 12.53s/it]  0%|          | 2/2001 [00:20<5:31:20,  9.95s/it]
