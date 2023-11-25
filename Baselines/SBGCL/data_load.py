@@ -9,9 +9,9 @@ from collections import defaultdict
 
 
 def load_data(dataset_name):
-    train_file_path = os.path.join('datasets', f'{dataset_name}_training.txt')
-    val_file_path = os.path.join('datasets', f'{dataset_name}_val.txt')
-    test_file_path = os.path.join('datasets', f'{dataset_name}_test.txt')
+    train_file_path = os.path.join('bitcoin', f'{dataset_name}_training.txt')
+    val_file_path = os.path.join('bitcoin', f'{dataset_name}_validation.txt')
+    test_file_path = os.path.join('bitcoin', f'{dataset_name}_testing.txt')
 
     train_edgelist = []
     with open(train_file_path) as f:

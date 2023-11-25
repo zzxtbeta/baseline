@@ -28,7 +28,7 @@ parser = argparse.ArgumentParser()
 
 parser.add_argument('--debug', action='store_true', default=False,
                     help='debug mode')
-parser.add_argument('--no-cuda', action='store_true', default=True,
+parser.add_argument('--no-cuda', action='store_true', default=False,
                     help='Disables CUDA training.')
 parser.add_argument('--dataset', type=str, default='review-1',
                     help='choose dataset')
