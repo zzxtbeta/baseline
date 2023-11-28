@@ -4,7 +4,7 @@ DATA_EMB_DIC1 = {
     'senate1to10': (145, 1056),
     'review': (182, 304),
     'bitcoin_alpha': (3783, 3783),
-    'bitcoin_otc': (4814, 5858)
+    'bitcoin_otc': (5858, 5858)
 }
 
 DATA_EMB_DIC = {**DATA_EMB_DIC1}

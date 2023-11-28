@@ -3,7 +3,7 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 
 # 读取原始数据集
-file_path = "/home/yrgu/topic/baseline/Datasets-used/topic_data/bitcoin_datasets/bitcoinalpha_sorted.csv"  # 请替换成你的数据集文件路径
+file_path = "/home/yrgu/topic/baseline/Datasets-used/topic_data/bitcoinotc_sorted.csv"  # 请替换成你的数据集文件路径
 data = pd.read_csv(file_path, delimiter='\t', header=None, names=['user', 'item', 'rating'])
 
 # 打印初始数据总条数
@@ -74,8 +74,8 @@ def print_label_counts(data_set, data_set_name):
     """
     label_counts = data_set['new_rating'].value_counts()
     print(f"{data_set_name} Label Counts:")
-    print(f"Label 0 count: {label_counts.get(0, 0)}")
-    print(f"Label 1 count: {label_counts.get(1, 0)}")
+    print(f"正常边和未标记的攻击边条数: {label_counts.get(0, 0)}")
+    print(f"已标记的攻击边条数: {label_counts.get(1, 0)}")
     print("\n")
 
 # 6. 划分数据集并保存（使用分层抽样）
@@ -87,11 +87,9 @@ for i in range(5):
     # 打印各自数据集的条数
     print_label_counts(train_set, f"bitcoin_alpha-{i+1}_training.txt")
     print_label_counts(validation_set, f"bitcoin_alpha-{i+1}_validation.txt")
-    print_label_counts(test_set, f"bitcoin_alpha-{i+1}_testing.txt")
-    print("------------------------------------------------------------------------")
-    
+    print_label_counts(test_set, f"bitcoin_alpha-{i+1}_testing.txt")    
     
     # 保存数据集
-    train_set.to_csv(f"bitcoin_alpha-{i+1}_training.txt", sep='\t', index=False, header=False)
-    validation_set.to_csv(f"bitcoin_alpha-{i+1}_validation.txt", sep='\t', index=False, header=False)
-    test_set.to_csv(f"bitcoin_alpha-{i+1}_testing.txt", sep='\t', index=False, header=False)
+    train_set.to_csv(f"bitcoin_otc-{i+1}_training.txt", sep='\t', index=False, header=False)
+    validation_set.to_csv(f"bitcoin_otc-{i+1}_validation.txt", sep='\t', index=False, header=False)
+    test_set.to_csv(f"bitcoin_otc-{i+1}_testing.txt", sep='\t', index=False, header=False)

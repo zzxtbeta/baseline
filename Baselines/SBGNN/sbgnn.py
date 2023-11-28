@@ -25,7 +25,7 @@ import torch.nn.functional as F
 
 
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import f1_score, roc_auc_score
+from sklearn.metrics import f1_score, roc_auc_score, precision_score, recall_score
 
 
 from tqdm import tqdm
@@ -38,8 +38,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--dirpath', default=BASE_DIR, help='Current Dir')
-parser.add_argument('--device', type=str, default='cuda:0', help='Devices')
-parser.add_argument('--dataset_name', type=str, default='review-2')
+parser.add_argument('--device', type=str, default='cuda:1', help='Devices')
+parser.add_argument('--dataset_name', type=str, default='bitcoin_alpha-1')
 parser.add_argument('--a_emb_size', type=int, default=32, help='Embeding A Size')
 parser.add_argument('--b_emb_size', type=int, default=32, help='Embeding B Size')
 parser.add_argument('--weight_decay', type=float, default=1e-5, help='Weight Decay')
@@ -272,6 +272,12 @@ class SBGNN(nn.Module):
         ## without mlp
         y = torch.einsum("ij, ij->i", [embedding_a[edge_lists[:, 0]] , embedding_b[edge_lists[:, 1]] ])
         y = torch.sigmoid(y)  # 添加sigmoid激活函数
+
+        # Check for NaN in the output
+        if torch.isnan(y).any():
+            print(f"此时的y值：{y}")
+            print("NaN values found in the forward output y!")
+
         return y
 
     def loss(self, pred_y, y):
@@ -279,37 +285,43 @@ class SBGNN(nn.Module):
         assert pred_y.size() == y.size(), 'must be same length'
         pos_ratio = y.sum() /  y.size()[0]
         weight = torch.where(y > 0.5, 1./pos_ratio, 1./(1-pos_ratio))
+
+        # Check for NaN in the loss
+        if torch.isnan(weight).any():
+            print("NaN values found in the loss weights!")
+
         # weight = torch.where(y > 0.5, (1-pos_ratio), pos_ratio)
-        return F.binary_cross_entropy(pred_y, y, weight=weight)
+        return F.binary_cross_entropy_with_logits(pred_y, y, weight=weight)
 
 
 # =========== function
 def load_data(dataset_name):
-    train_file_path = os.path.join('datasets', f'{dataset_name}_training.txt')
-    val_file_path = os.path.join('datasets', f'{dataset_name}_validation.txt')
-    test_file_path = os.path.join('datasets', f'{dataset_name}_testing.txt')
+    train_file_path = os.path.join('topic_data/bitcoin_datasets', f'{dataset_name}_training.txt')
+    val_file_path = os.path.join('topic_data/bitcoin_datasets', f'{dataset_name}_validation.txt')
+    test_file_path = os.path.join('topic_data/bitcoin_datasets', f'{dataset_name}_testing.txt')
 
     train_edgelist = []
     with open(train_file_path) as f:
         for ind, line in enumerate(f):
             if ind == 0: continue
-            a, b, s = map(int, line.split('\t'))
-            train_edgelist.append((a, b, s))
+            a, b, s ,k= map(int, line.split('\t'))
+            train_edgelist.append((a, b, s, k))
 
     val_edgelist = []
     with open(val_file_path) as f:
         for ind, line in enumerate(f):
             if ind == 0: continue
-            a, b, s = map(int, line.split('\t'))
-            val_edgelist.append((a, b, s))
+            a, b, s, k = map(int, line.split('\t'))
+            val_edgelist.append((a, b, s, k))
 
     test_edgelist = []
     with open(test_file_path) as f:
         for ind, line in enumerate(f):
             if ind == 0: continue
-            a, b, s = map(int, line.split('\t'))
-            test_edgelist.append((a, b, s))
+            a, b, s, k = map(int, line.split('\t'))
+            test_edgelist.append((a, b, s, k))
 
+    # print(f"np.array(val_edgelist): {np.array(val_edgelist)}")
     return np.array(train_edgelist), np.array(val_edgelist), np.array(test_edgelist)
 
 
@@ -320,7 +332,7 @@ def load_edgelists(edge_lists):
     edgelist_a_a_pos, edgelist_a_a_neg = defaultdict(list), defaultdict(list)
     edgelist_b_b_pos, edgelist_b_b_neg = defaultdict(list), defaultdict(list)
 
-    for a, b, s in edge_lists:
+    for a, b, s ,k in edge_lists:
         if s == 1:
             edgelist_a_b_pos[a].append(b)
             edgelist_b_a_pos[b].append(a)
@@ -328,12 +340,12 @@ def load_edgelists(edge_lists):
             edgelist_a_b_neg[a].append(b)
             edgelist_b_a_neg[b].append(a)
         else:
-            print(a, b, s)
+            print(a, b, s, k)
             raise Exception("s must be -1/1")
 
     edge_list_a_a = defaultdict(lambda: defaultdict(int))
     edge_list_b_b = defaultdict(lambda: defaultdict(int))
-    for a, b, s in edge_lists:
+    for a, b, s, k in edge_lists:
         for b2 in edgelist_a_b_pos[a]:
             edge_list_b_b[b][b2] += 1 * s
         for b2 in edgelist_a_b_neg[a]:
@@ -364,23 +376,54 @@ def load_edgelists(edge_lists):
     return edgelist_a_b_pos, edgelist_a_b_neg, edgelist_b_a_pos, edgelist_b_a_neg,\
                     edgelist_a_a_pos, edgelist_a_a_neg, edgelist_b_b_pos, edgelist_b_b_neg
 
+def find_best_threshold(pred_y, y):
+    best_threshold = 0.5
+    best_f1 = 0
+
+    preds = pred_y.cpu().numpy() if isinstance(pred_y, torch.Tensor) else pred_y
+    y = y.cpu().numpy() if isinstance(y, torch.Tensor) else y
+
+    for threshold in np.arange(0.01, 1, 0.01):
+        thresholded_preds = (preds >= threshold).astype(int)
+
+        f1 = f1_score(y, thresholded_preds)
+
+        if f1 > best_f1:
+            best_f1 = f1
+            best_threshold = threshold
+
+    return best_threshold, best_f1
+
+
 
 @torch.no_grad()
 def test_and_val(pred_y, y, mode='val', epoch=0):
     preds = pred_y.cpu().numpy()
     y = y.cpu().numpy()
 
-    preds[preds >= 0.5]  = 1
-    preds[preds < 0.5] = 0
+    # preds[preds >= 0.5]  = 1
+    # preds[preds < 0.5] = 0
+    # test_y = y
+
+    # Find the best threshold
+    best_threshold, best_f1 = find_best_threshold(pred_y, y)
+    print(f"best_threshold: {best_threshold} ， best_f1: {best_f1}")
+    # Apply the best threshold
+    preds[preds >= best_threshold] = 1
+    preds[preds < best_threshold] = 0
     test_y = y
 
     auc = roc_auc_score(test_y, preds)
+    precision = precision_score(test_y, preds)
+    recall = recall_score(test_y,preds)
     f1 = f1_score(test_y, preds)
     macro_f1 = f1_score(test_y, preds, average='macro')
     micro_f1 = f1_score(test_y, preds, average='micro')
     pos_ratio = np.sum(test_y) /  len(test_y)
     res = {
         f'{mode}_auc': auc,
+        f'{mode}_precision': precision,
+        f'{mode}_recall': recall,
         f'{mode}_f1' : f1,
         f'{mode}_pos_ratio': pos_ratio,
         f'{mode}_epoch': epoch,
@@ -404,9 +447,13 @@ def run():
     val_y   = np.array([i[-1] for i in val_edgelist])
     test_y  = np.array([i[-1] for i in test_edgelist])
 
-    train_y = torch.from_numpy( (train_y + 1)/2 ).float().to(args.device)
-    val_y = torch.from_numpy( (val_y + 1)/2 ).float().to(args.device)
-    test_y = torch.from_numpy( (test_y + 1)/2 ).float().to(args.device)
+    # train_y = torch.from_numpy( (train_y + 1)/2 ).float().to(args.device)
+    # val_y = torch.from_numpy( (val_y + 1)/2 ).float().to(args.device)
+    # test_y = torch.from_numpy( (test_y + 1)/2 ).float().to(args.device)
+
+    train_y = torch.from_numpy( train_y ).float().to(args.device)
+    val_y = torch.from_numpy( val_y).float().to(args.device)
+    test_y = torch.from_numpy( test_y).float().to(args.device)
     # get edge lists
     edgelists = load_edgelists(train_edgelist)
 
@@ -439,6 +486,12 @@ def run():
         # val/test
             model.eval()
             pred_y = model(train_edgelist)
+            # print("test_y 中的唯一值:", np.unique(test_y.cpu().detach().numpy()))
+            # print("preds 中的唯一值:", np.unique(pred_y.cpu().detach().numpy()))
+            if torch.isnan(pred_y).any():
+                print("pred_y中出现了Nan")
+                print(f"此时的pred_y值：{[pred_y]}")
+
             res = test_and_val(pred_y, train_y, mode='train', epoch=epoch)
             res_cur.update(res)
             pred_val_y = model(val_edgelist)

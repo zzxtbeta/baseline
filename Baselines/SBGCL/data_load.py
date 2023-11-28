@@ -9,29 +9,38 @@ from collections import defaultdict
 
 
 def load_data(dataset_name):
-    train_file_path = os.path.join('bitcoin', f'{dataset_name}_training.txt')
-    val_file_path = os.path.join('bitcoin', f'{dataset_name}_validation.txt')
-    test_file_path = os.path.join('bitcoin', f'{dataset_name}_testing.txt')
+    train_file_path = os.path.join('topic_datasets/bitcoin_datasets', f'{dataset_name}_training.txt')
+    val_file_path = os.path.join('topic_datasets/bitcoin_datasets', f'{dataset_name}_validation.txt')
+    test_file_path = os.path.join('topic_datasets/bitcoin_datasets', f'{dataset_name}_testing.txt')
 
     train_edgelist = []
+    train_labels = []  # 新增的第四列数据，用于作为标签
     with open(train_file_path) as f:
         for ind, line in enumerate(f):
-            a, b, s = map(int, line.split('\t'))
+            a, b, s, k = map(int, line.split('\t'))
             train_edgelist.append((a, b, s))
+            train_labels.append(k)  # 将第四列数据添加到标签列表
+            
 
     val_edgelist = []
+    val_labels = []  # 新增的第四列数据，用于作为标签
     with open(val_file_path) as f:
         for ind, line in enumerate(f):
-            a, b, s = map(int, line.split('\t'))
+            a, b, s, k = map(int, line.split('\t'))
             val_edgelist.append((a, b, s))
+            val_labels.append(k)  # 将第四列数据添加到标签列表
 
     test_edgelist = []
+    test_labels = []  # 新增的第四列数据，用于作为标签
     with open(test_file_path) as f:
         for ind, line in enumerate(f):
-            a, b, s = map(int, line.split('\t'))
+            a, b, s, k = map(int, line.split('\t'))
             test_edgelist.append((a, b, s))
+            test_labels.append(k)  # 将第四列数据添加到标签列表
 
-    return np.array(train_edgelist), np.array(val_edgelist), np.array(test_edgelist)
+    return np.array(train_edgelist), np.array(train_labels), \
+           np.array(val_edgelist), np.array(val_labels), \
+           np.array(test_edgelist), np.array(test_labels)
 
 def load_new_data(dataset_name):
     train_file_path = os.path.join('new_datasets', f'{dataset_name}_training.txt')
@@ -41,19 +50,19 @@ def load_new_data(dataset_name):
     train_edgelist = []
     with open(train_file_path) as f:
         for ind, line in enumerate(f):
-            a, b, s = map(int, line.split('\t'))
+            a, b, s, k = map(int, line.split('\t'))
             train_edgelist.append((a, b, s))
 
     val_edgelist = []
     with open(val_file_path) as f:
         for ind, line in enumerate(f):
-            a, b, s = map(int, line.split('\t'))
+            a, b, s, k = map(int, line.split('\t'))
             val_edgelist.append((a, b, s))
 
     test_edgelist = []
     with open(test_file_path) as f:
         for ind, line in enumerate(f):
-            a, b, s = map(int, line.split('\t'))
+            a, b, s, k = map(int, line.split('\t'))
             test_edgelist.append((a, b, s))
 
     return np.array(train_edgelist), np.array(val_edgelist), np.array(test_edgelist)

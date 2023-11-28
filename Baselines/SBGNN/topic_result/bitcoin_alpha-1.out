@@ -1,0 +1,1327 @@
+sbgnn.py --dataset_name bitcoin_alpha-1
+#!/usr/bin/env python3
+#-*- coding: utf-8 -*-
+"""
+@author: huangjunjie
+@file: sbgnn.py
+@time: 2021/03/28
+"""
+
+
+import os
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+import sys
+import time
+import random
+import argparse
+import subprocess
+
+from collections import defaultdict
+
+import numpy as np
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import f1_score, roc_auc_score
+
+
+from tqdm import tqdm
+
+import logging
+# https://docs.python.org/3/howto/logging.html#logging-advanced-tutorial
+
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--dirpath', default=BASE_DIR, help='Current Dir')
+parser.add_argument('--device', type=str, default='cuda:0', help='Devices')
+parser.add_argument('--dataset_name', type=str, default='bitcoin_alpha-1')
+parser.add_argument('--a_emb_size', type=int, default=32, help='Embeding A Size')
+parser.add_argument('--b_emb_size', type=int, default=32, help='Embeding B Size')
+parser.add_argument('--weight_decay', type=float, default=1e-5, help='Weight Decay')
+parser.add_argument('--lr', type=float, default=0.005, help='Learning Rate')
+parser.add_argument('--seed', type=int, default=2023, help='Random seed')
+parser.add_argument('--epoch', type=int, default=2000, help='Epoch')
+parser.add_argument('--gnn_layer_num', type=int, default=2, help='GNN Layer')
+parser.add_argument('--batch_size', type=int, default=500, help='Batch Size')
+parser.add_argument('--dropout', type=float, default=0.5, help='Dropout')
+parser.add_argument('--agg', type=str, default='AttentionAggregator', choices=['AttentionAggregator', 'MeanAggregator'], help='Aggregator')
+args = parser.parse_args()
+
+
+# TODO
+
+exclude_hyper_params = ['dirpath', 'device']
+hyper_params = dict(vars(args))
+for exclude_p in exclude_hyper_params:
+    del hyper_params[exclude_p]
+
+hyper_params = "~".join([f"{k}-{v}" for k,v in hyper_params.items()])
+
+from torch.utils.tensorboard import SummaryWriter
+# https://pytorch.org/docs/stable/tensorboard.html
+tb_writer = SummaryWriter(comment=hyper_params)
+
+
+def setup_seed(seed):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+# setup seed
+setup_seed(args.seed)
+
+from common import DATA_EMB_DIC
+
+# args.device = 'cpu'
+args.device = torch.device(args.device)
+
+class MeanAggregator(nn.Module):
+    def __init__(self, a_dim, b_dim):
+        super(MeanAggregator, self).__init__()
+
+        self.out_mlp_layer = nn.Sequential(
+            nn.Linear(b_dim, b_dim)
+        )
+
+    def forward(self, edge_dic_list: dict, feature_a, feature_b, node_num_a, node_num_b):
+
+        edges = []
+        for node in range(node_num_a):
+            neighs = np.array(edge_dic_list[node]).reshape(-1, 1)
+            a = np.array([node]).repeat(len(neighs)).reshape(-1, 1)
+            edges.append(np.concatenate([a, neighs], axis=1))
+
+        edges = np.vstack(edges)
+        edges = torch.LongTensor(edges).to(args.device)
+        matrix = torch.sparse_coo_tensor(edges.t(), torch.ones(edges.shape[0]), torch.Size([node_num_a, node_num_b]), device=args.device)
+        row_sum = torch.spmm(matrix, torch.ones(size=(node_num_b, 1)).to(args.device))
+        row_sum = torch.where(row_sum == 0, torch.ones(row_sum.shape).to(args.device), row_sum)
+
+        new_emb = feature_b
+        new_emb = self.out_mlp_layer(new_emb)
+        output_emb = torch.spmm(matrix, new_emb)
+        output_emb = output_emb.div(row_sum)
+
+        return output_emb
+
+
+class AttentionAggregator(nn.Module):
+    def __init__(self, a_dim, b_dim):
+        super(AttentionAggregator, self).__init__()
+
+        self.out_mlp_layer = nn.Sequential(
+            nn.Linear(b_dim, b_dim),
+        )
+
+        self.a = nn.Parameter(torch.FloatTensor(a_dim + b_dim, 1))
+        nn.init.kaiming_normal_(self.a.data)
+
+    def forward(self, edge_dic_list: dict, feature_a, feature_b, node_num_a, node_num_b):
+
+        edges = []
+        for node in range(node_num_a):
+            neighs = np.array(edge_dic_list[node]).reshape(-1, 1)
+            a = np.array([node]).repeat(len(neighs)).reshape(-1, 1)
+            edges.append(np.concatenate([a, neighs], axis=1))
+
+        edges = np.vstack(edges)
+        edges = torch.LongTensor(edges).to(args.device)
+
+        new_emb = feature_b
+        new_emb = self.out_mlp_layer(new_emb)
+
+        # print("=======139=====================================139================================139==============")
+        # print(f"edge.shape:{edges.shape}")
+        # print("Edges[:, 0]:", edges[:, 0].shape)
+        # print("Edges[:, 1]:", edges[:, 1].shape)
+        # print("===================================================================================================")
+        # print("Max index in Edges[:, 0]:", torch.max(edges[:, 0]))
+        # print("Min index in Edges[:, 0]:", torch.min(edges[:, 0]))
+        edge_h_2 = torch.cat([feature_a[edges[:, 0]], new_emb[edges[:, 1]] ], dim=1)
+        edges_h = torch.exp(F.elu(torch.einsum("ij,jl->il", [edge_h_2, self.a]), 0.1))
+
+        matrix = torch.sparse_coo_tensor(edges.t(), edges_h[:, 0], torch.Size([node_num_a, node_num_b]), device=args.device)
+        row_sum = torch.sparse.mm(matrix, torch.ones(size=(node_num_b, 1)).to(args.device))
+        row_sum = torch.where(row_sum == 0, torch.ones(row_sum.shape).to(args.device), row_sum)
+
+        output_emb = torch.sparse.mm(matrix, new_emb)
+        output_emb = output_emb.div(row_sum)
+        return output_emb
+
+
+
+class SBGNNLayer(nn.Module):
+    def __init__(self, edgelist_a_b_pos, edgelist_a_b_neg, edgelist_b_a_pos, edgelist_b_a_neg,\
+                    edgelist_a_a_pos, edgelist_a_a_neg, edgelist_b_b_pos, edgelist_b_b_neg, \
+        dataset_name=args.dataset_name, emb_size_a=32, emb_size_b=32, aggregator=MeanAggregator):
+        super(SBGNNLayer, self).__init__()
+        #
+        self.set_a_num, self.set_b_num = DATA_EMB_DIC[dataset_name]
+
+        # self.feature_a = feature_a
+        # self.feature_b = feature_b
+        self.edgelist_a_b_pos, self.edgelist_a_b_neg, self.edgelist_b_a_pos, self.edgelist_b_a_neg = \
+            edgelist_a_b_pos, edgelist_a_b_neg, edgelist_b_a_pos, edgelist_b_a_neg
+        self.edgelist_a_a_pos, self.edgelist_a_a_neg, self.edgelist_b_b_pos, self.edgelist_b_b_neg = \
+            edgelist_a_a_pos, edgelist_a_a_neg, edgelist_b_b_pos, edgelist_b_b_neg
+
+        self.agg_a_from_b_pos = aggregator(emb_size_b, emb_size_a)
+        self.agg_a_from_b_neg = aggregator(emb_size_b, emb_size_a)
+        self.agg_a_from_a_pos = aggregator(emb_size_a, emb_size_a)
+        self.agg_a_from_a_neg = aggregator(emb_size_a, emb_size_a)
+
+        self.agg_b_from_a_pos = aggregator(emb_size_a, emb_size_b)
+        self.agg_b_from_a_neg = aggregator(emb_size_a, emb_size_b)
+        self.agg_b_from_b_pos = aggregator(emb_size_b, emb_size_b)
+        self.agg_b_from_b_neg = aggregator(emb_size_b, emb_size_b)
+
+        self.update_func = nn.Sequential(
+            nn.Dropout(args.dropout),
+            nn.Linear(emb_size_a * 5, emb_size_a * 2),
+            nn.PReLU(),
+            nn.Linear(emb_size_b * 2, emb_size_b)
+
+        )
+
+
+
+    def forward(self, feature_a, feature_b):
+        # assert feature_a.size()[0] == self.set_a_num, 'set_b_num error'
+        # assert feature_b.size()[0] == self.set_b_num, 'set_b_num error'
+
+        node_num_a, node_num_b = self.set_a_num, self.set_b_num
+
+        m_a_from_b_pos = self.agg_a_from_b_pos(self.edgelist_a_b_pos, feature_a, feature_b, node_num_a, node_num_b)
+        m_a_from_b_neg = self.agg_a_from_b_neg(self.edgelist_a_b_neg, feature_a, feature_b, node_num_a, node_num_b)
+        m_a_from_a_pos = self.agg_a_from_a_pos(self.edgelist_a_a_pos, feature_a, feature_a, node_num_a, node_num_a)
+        m_a_from_a_neg = self.agg_a_from_a_neg(self.edgelist_a_a_neg, feature_a, feature_a, node_num_a, node_num_a)
+
+        new_feature_a = torch.cat([feature_a, m_a_from_b_pos, m_a_from_b_neg, m_a_from_a_pos, m_a_from_a_neg], dim=1)
+        new_feature_a = self.update_func(new_feature_a)
+
+        m_b_from_a_pos = self.agg_b_from_a_pos(self.edgelist_b_a_pos, feature_b, feature_a, node_num_b, node_num_a)
+        m_b_from_a_neg = self.agg_b_from_a_neg(self.edgelist_b_a_neg, feature_b, feature_a, node_num_b, node_num_a)
+        m_b_from_b_pos = self.agg_b_from_b_pos(self.edgelist_b_b_pos, feature_b, feature_b, node_num_b, node_num_b)
+        m_b_from_b_neg = self.agg_b_from_b_neg(self.edgelist_b_b_neg, feature_b, feature_b, node_num_b, node_num_b)
+
+        new_feature_b = torch.cat([feature_b, m_b_from_a_pos, m_b_from_a_neg, m_b_from_b_pos, m_b_from_b_neg], dim=1)
+        new_feature_b = self.update_func(new_feature_b)
+
+        return new_feature_a, new_feature_b
+
+
+
+class SBGNN(nn.Module):
+    def __init__(self, edgelists,
+                    dataset_name=args.dataset_name, layer_num=1, emb_size_a=32, emb_size_b=32, aggregator=AttentionAggregator):
+        super(SBGNN, self).__init__()
+
+        # assert edgelists must compelte
+        assert len(edgelists) == 8, 'must 8 edgelists'
+        edgelist_a_b_pos, edgelist_a_b_neg, edgelist_b_a_pos, edgelist_b_a_neg,\
+                    edgelist_a_a_pos, edgelist_a_a_neg, edgelist_b_b_pos, edgelist_b_b_neg = edgelists
+
+        self.set_a_num, self.set_b_num = DATA_EMB_DIC[dataset_name]
+
+        self.features_a = nn.Embedding(self.set_a_num, emb_size_a)
+        self.features_b = nn.Embedding(self.set_b_num, emb_size_b)
+        self.features_a.weight.requires_grad = True
+        self.features_b.weight.requires_grad = True
+        # features_a = features_a.to(args.device)
+        # features_b = features_b.to(args.device)
+
+        self.layers = nn.ModuleList(
+            [SBGNNLayer(edgelist_a_b_pos, edgelist_a_b_neg, edgelist_b_a_pos, edgelist_b_a_neg,\
+                    edgelist_a_a_pos, edgelist_a_a_neg, edgelist_b_b_pos, edgelist_b_b_neg, \
+                    dataset_name=dataset_name, emb_size_a=32, emb_size_b=32, aggregator=aggregator) for _ in range(layer_num)]
+        )
+        # self.mlp = nn.Sequential(
+        #     nn.Linear(emb_size_a * 3, 30),
+        #     nn.PReLU(),
+        #     nn.Linear(30, 1),
+        #     nn.Sigmoid()
+        # )
+        # def init_weights(m):
+        #     if type(m) == nn.Linear:
+        #         torch.nn.init.xavier_uniform_(m.weight)
+        #         m.bias.data.fill_(0.01)
+        # self.apply(init_weights)
+
+
+    def get_embeddings(self):
+        emb_a = self.features_a(torch.arange(self.set_a_num).to(args.device))
+        emb_b = self.features_b(torch.arange(self.set_b_num).to(args.device))
+        for m in self.layers:
+            emb_a, emb_b = m(emb_a, emb_b)
+        return emb_a, emb_b
+
+    def forward(self, edge_lists):
+        embedding_a, embedding_b = self.get_embeddings()
+
+        #### with mlp
+        # emb_concat = torch.cat([embedding_a[edge_lists[:, 0]], embedding_b[edge_lists[:, 1]], embedding_a[edge_lists[:, 0]] * embedding_b[edge_lists[:, 1]] ], dim=1)
+        # y = self.mlp(emb_concat).squeeze(-1)
+        # return y
+
+        ## without mlp
+        y = torch.einsum("ij, ij->i", [embedding_a[edge_lists[:, 0]] , embedding_b[edge_lists[:, 1]] ])
+        y = torch.sigmoid(y)  # 添加sigmoid激活函数
+
+        # Check for NaN in the output
+        if torch.isnan(y).any():
+            print("NaN values found in the forward output y!")
+
+        return y
+
+    def loss(self, pred_y, y):
+        assert y.min() >= 0, 'must 0~1'
+        assert pred_y.size() == y.size(), 'must be same length'
+        pos_ratio = y.sum() /  y.size()[0]
+        weight = torch.where(y > 0.5, 1./pos_ratio, 1./(1-pos_ratio))
+
+        # Check for NaN in the loss
+        if torch.isnan(weight).any():
+            print("NaN values found in the loss weights!")
+
+        # weight = torch.where(y > 0.5, (1-pos_ratio), pos_ratio)
+        return F.binary_cross_entropy(pred_y, y, weight=weight)
+
+
+# =========== function
+def load_data(dataset_name):
+    train_file_path = os.path.join('topic_data/bitcoin_datasets', f'{dataset_name}_training.txt')
+    val_file_path = os.path.join('topic_data/bitcoin_datasets', f'{dataset_name}_validation.txt')
+    test_file_path = os.path.join('topic_data/bitcoin_datasets', f'{dataset_name}_testing.txt')
+
+    train_edgelist = []
+    with open(train_file_path) as f:
+        for ind, line in enumerate(f):
+            if ind == 0: continue
+            a, b, s ,k= map(int, line.split('\t'))
+            train_edgelist.append((a, b, s, k))
+
+    val_edgelist = []
+    with open(val_file_path) as f:
+        for ind, line in enumerate(f):
+            if ind == 0: continue
+            a, b, s, k = map(int, line.split('\t'))
+            val_edgelist.append((a, b, s, k))
+
+    test_edgelist = []
+    with open(test_file_path) as f:
+        for ind, line in enumerate(f):
+            if ind == 0: continue
+            a, b, s, k = map(int, line.split('\t'))
+            test_edgelist.append((a, b, s, k))
+
+    # print(f"np.array(val_edgelist): {np.array(val_edgelist)}")
+    return np.array(train_edgelist), np.array(val_edgelist), np.array(test_edgelist)
+
+
+# ============= load data
+def load_edgelists(edge_lists):
+    edgelist_a_b_pos, edgelist_a_b_neg = defaultdict(list), defaultdict(list)
+    edgelist_b_a_pos, edgelist_b_a_neg = defaultdict(list), defaultdict(list)
+    edgelist_a_a_pos, edgelist_a_a_neg = defaultdict(list), defaultdict(list)
+    edgelist_b_b_pos, edgelist_b_b_neg = defaultdict(list), defaultdict(list)
+
+    for a, b, s ,k in edge_lists:
+        if s == 1:
+            edgelist_a_b_pos[a].append(b)
+            edgelist_b_a_pos[b].append(a)
+        elif s== -1:
+            edgelist_a_b_neg[a].append(b)
+            edgelist_b_a_neg[b].append(a)
+        else:
+            print(a, b, s, k)
+            raise Exception("s must be -1/1")
+
+    edge_list_a_a = defaultdict(lambda: defaultdict(int))
+    edge_list_b_b = defaultdict(lambda: defaultdict(int))
+    for a, b, s, k in edge_lists:
+        for b2 in edgelist_a_b_pos[a]:
+            edge_list_b_b[b][b2] += 1 * s
+        for b2 in edgelist_a_b_neg[a]:
+            edge_list_b_b[b][b2] -= 1 * s
+        for a2 in edgelist_b_a_pos[b]:
+            edge_list_a_a[a][a2] += 1 * s
+        for a2 in edgelist_b_a_neg[b]:
+            edge_list_a_a[a][a2] -= 1 * s
+
+    for a1 in edge_list_a_a:
+        for a2 in edge_list_a_a[a1]:
+            v = edge_list_a_a[a1][a2]
+            if a1 == a2: continue
+            if v > 0:
+                edgelist_a_a_pos[a1].append(a2)
+            elif v < 0:
+                edgelist_a_a_neg[a1].append(a2)
+
+    for b1 in edge_list_b_b:
+        for b2 in edge_list_b_b[b1]:
+            v = edge_list_b_b[b1][b2]
+            if b1 == b2: continue
+            if v > 0:
+                edgelist_b_b_pos[b1].append(b2)
+            elif v < 0:
+                edgelist_b_b_neg[b1].append(b2)
+
+    return edgelist_a_b_pos, edgelist_a_b_neg, edgelist_b_a_pos, edgelist_b_a_neg,\
+                    edgelist_a_a_pos, edgelist_a_a_neg, edgelist_b_b_pos, edgelist_b_b_neg
+
+
+@torch.no_grad()
+def test_and_val(pred_y, y, mode='val', epoch=0):
+    preds = pred_y.cpu().numpy()
+    y = y.cpu().numpy()
+
+    preds[preds >= 0.5]  = 1
+    preds[preds < 0.5] = 0
+    test_y = y
+
+    auc = roc_auc_score(test_y, preds)
+    f1 = f1_score(test_y, preds)
+    macro_f1 = f1_score(test_y, preds, average='macro')
+    micro_f1 = f1_score(test_y, preds, average='micro')
+    pos_ratio = np.sum(test_y) /  len(test_y)
+    res = {
+        f'{mode}_auc': auc,
+        f'{mode}_f1' : f1,
+        f'{mode}_pos_ratio': pos_ratio,
+        f'{mode}_epoch': epoch,
+        f'{mode}_macro_f1' : macro_f1,
+        f'{mode}_micro_f1' : micro_f1,
+    }
+    for k, v in res.items():
+        mode ,_, metric = k.partition('_')
+        tb_writer.add_scalar(f'{metric}/{mode}', v, epoch)
+    # tb_writer.add_scalar( f'{mode}_auc', auc, epoch)
+    # tb_writer.add_scalar( f'{mode}_f1', auc, epoch)
+    return res
+
+
+
+def run():
+    train_edgelist, val_edgelist, test_edgelist  = load_data(args.dataset_name)
+
+    set_a_num, set_b_num = DATA_EMB_DIC[args.dataset_name]
+    train_y = np.array([i[-1] for i in train_edgelist])
+    val_y   = np.array([i[-1] for i in val_edgelist])
+    test_y  = np.array([i[-1] for i in test_edgelist])
+
+    # train_y = torch.from_numpy( (train_y + 1)/2 ).float().to(args.device)
+    # val_y = torch.from_numpy( (val_y + 1)/2 ).float().to(args.device)
+    # test_y = torch.from_numpy( (test_y + 1)/2 ).float().to(args.device)
+
+    train_y = torch.from_numpy( train_y ).float().to(args.device)
+    val_y = torch.from_numpy( val_y).float().to(args.device)
+    test_y = torch.from_numpy( test_y).float().to(args.device)
+    # get edge lists
+    edgelists = load_edgelists(train_edgelist)
+
+    if args.agg == 'MeanAggregator':
+        agg = MeanAggregator
+    else:
+        agg = AttentionAggregator
+
+    model = SBGNN(edgelists, dataset_name=args.dataset_name, layer_num=args.gnn_layer_num, aggregator=agg)
+    model = model.to(args.device)
+
+    print(model.train())
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    res_best = {'val_auc': 0}
+    for epoch in tqdm(range(1, args.epoch + 2)):
+        # train
+        model.train()
+        optimizer.zero_grad()
+        pred_y = model(train_edgelist)
+        loss = model.loss(pred_y, train_y)
+        loss.backward()
+        optimizer.step()
+        print('loss', loss)
+
+
+        res_cur = {}
+        # if epoch % 5 == 0:
+        if True:
+        # val/test
+            model.eval()
+            pred_y = model(train_edgelist)
+            # print("test_y 中的唯一值:", np.unique(test_y.cpu().detach().numpy()))
+            # print("preds 中的唯一值:", np.unique(pred_y.cpu().detach().numpy()))
+            if torch.isnan(pred_y).any():
+                print("pred_y中出现了Nan")
+
+            res = test_and_val(pred_y, train_y, mode='train', epoch=epoch)
+            res_cur.update(res)
+            pred_val_y = model(val_edgelist)
+            res = test_and_val(pred_val_y, val_y, mode='val', epoch=epoch)
+            res_cur.update(res)
+            pred_test_y = model(test_edgelist)
+            res = test_and_val(pred_test_y, test_y, mode='test', epoch=epoch)
+            res_cur.update(res)
+            if res_cur['val_auc'] > res_best['val_auc']:
+                res_best = res_cur
+                print(res_best)
+    print('Done! Best Results:')
+    print(res_best)
+    print_list = ['test_auc', 'test_f1', 'test_macro_f1', 'test_micro_f1']
+    for i in print_list:
+        print(i, res_best[i], end=' ')
+
+
+
+def main():
+    print(" ".join(sys.argv))
+    this_fpath = os.path.abspath(__file__)
+    t = subprocess.run(f'cat {this_fpath}', shell=True, stdout=subprocess.PIPE)
+    print(str(t.stdout, 'utf-8'))
+    print('=' * 20)
+    run()
+
+if __name__ == "__main__":
+    main()
+
+====================
+SBGNN(
+  (features_a): Embedding(3783, 32)
+  (features_b): Embedding(3783, 32)
+  (layers): ModuleList(
+    (0-1): 2 x SBGNNLayer(
+      (agg_a_from_b_pos): AttentionAggregator(
+        (out_mlp_layer): Sequential(
+          (0): Linear(in_features=32, out_features=32, bias=True)
+        )
+      )
+      (agg_a_from_b_neg): AttentionAggregator(
+        (out_mlp_layer): Sequential(
+          (0): Linear(in_features=32, out_features=32, bias=True)
+        )
+      )
+      (agg_a_from_a_pos): AttentionAggregator(
+        (out_mlp_layer): Sequential(
+          (0): Linear(in_features=32, out_features=32, bias=True)
+        )
+      )
+      (agg_a_from_a_neg): AttentionAggregator(
+        (out_mlp_layer): Sequential(
+          (0): Linear(in_features=32, out_features=32, bias=True)
+        )
+      )
+      (agg_b_from_a_pos): AttentionAggregator(
+        (out_mlp_layer): Sequential(
+          (0): Linear(in_features=32, out_features=32, bias=True)
+        )
+      )
+      (agg_b_from_a_neg): AttentionAggregator(
+        (out_mlp_layer): Sequential(
+          (0): Linear(in_features=32, out_features=32, bias=True)
+        )
+      )
+      (agg_b_from_b_pos): AttentionAggregator(
+        (out_mlp_layer): Sequential(
+          (0): Linear(in_features=32, out_features=32, bias=True)
+        )
+      )
+      (agg_b_from_b_neg): AttentionAggregator(
+        (out_mlp_layer): Sequential(
+          (0): Linear(in_features=32, out_features=32, bias=True)
+        )
+      )
+      (update_func): Sequential(
+        (0): Dropout(p=0.5, inplace=False)
+        (1): Linear(in_features=160, out_features=64, bias=True)
+        (2): PReLU(num_parameters=1)
+        (3): Linear(in_features=64, out_features=32, bias=True)
+      )
+    )
+  )
+)
+  0%|          | 0/2001 [00:00<?, ?it/s]  0%|          | 1/2001 [00:25<14:22:28, 25.87s/it]  0%|          | 2/2001 [00:50<13:50:47, 24.94s/it]  0%|          | 3/2001 [01:14<13:36:24, 24.52s/it]  0%|          | 4/2001 [01:38<13:29:33, 24.32s/it]  0%|          | 5/2001 [02:02<13:26:15, 24.24s/it]  0%|          | 6/2001 [02:26<13:24:59, 24.21s/it]  0%|          | 7/2001 [02:50<13:22:33, 24.15s/it]  0%|          | 8/2001 [03:14<13:20:42, 24.11s/it]  0%|          | 9/2001 [03:38<13:20:02, 24.10s/it]  0%|          | 10/2001 [04:02<13:22:15, 24.18s/it]  1%|          | 11/2001 [04:26<13:20:53, 24.15s/it]  1%|          | 12/2001 [04:51<13:19:54, 24.13s/it]  1%|          | 13/2001 [05:15<13:19:33, 24.13s/it]  1%|          | 14/2001 [05:39<13:19:51, 24.15s/it]  1%|          | 15/2001 [06:03<13:18:56, 24.14s/it]  1%|          | 16/2001 [06:27<13:18:15, 24.13s/it]  1%|          | 17/2001 [06:51<13:16:55, 24.10s/it]  1%|          | 18/2001 [07:15<13:17:40, 24.14s/it]  1%|          | 19/2001 [07:39<13:15:59, 24.10s/it]  1%|          | 20/2001 [08:04<13:16:03, 24.11s/it]  1%|          | 21/2001 [08:28<13:15:04, 24.09s/it]  1%|          | 22/2001 [08:52<13:15:37, 24.12s/it]  1%|          | 23/2001 [09:16<13:14:25, 24.10s/it]  1%|          | 24/2001 [09:40<13:13:36, 24.09s/it]  1%|          | 25/2001 [10:04<13:13:07, 24.08s/it]  1%|▏         | 26/2001 [10:28<13:13:13, 24.10s/it]  1%|▏         | 27/2001 [10:52<13:11:38, 24.06s/it]  1%|▏         | 28/2001 [11:16<13:11:18, 24.06s/it]  1%|▏         | 29/2001 [11:40<13:11:59, 24.10s/it]  1%|▏         | 30/2001 [12:05<13:13:05, 24.14s/it]  2%|▏         | 31/2001 [12:29<13:11:38, 24.11s/it]loss tensor(1.4054, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+{'train_auc': 0.5, 'train_f1': 0.037373150341991145, 'train_pos_ratio': 0.019042412646348685, 'train_epoch': 1, 'train_macro_f1': 0.018686575170995572, 'train_micro_f1': 0.019042412646348685, 'val_auc': 0.5, 'val_f1': 0.036894696387394316, 'val_pos_ratio': 0.018794048551292093, 'val_epoch': 1, 'val_macro_f1': 0.018447348193697158, 'val_micro_f1': 0.018794048551292093, 'test_auc': 0.5, 'test_f1': 0.03780718336483932, 'test_pos_ratio': 0.019267822736030827, 'test_epoch': 1, 'test_macro_f1': 0.01890359168241966, 'test_micro_f1': 0.019267822736030827}
+loss tensor(1.3865, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(1.3753, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+{'train_auc': 0.514048205080574, 'train_f1': 0.03841205660724131, 'train_pos_ratio': 0.019042412646348685, 'train_epoch': 3, 'train_macro_f1': 0.04653460360400913, 'train_micro_f1': 0.04660379937132704, 'val_auc': 0.5075818036711892, 'val_f1': 0.03744149765990639, 'val_pos_ratio': 0.018794048551292093, 'val_epoch': 3, 'val_macro_f1': 0.03365785574819219, 'val_micro_f1': 0.033672670321064996, 'test_auc': 0.5104125736738703, 'test_f1': 0.038580246913580245, 'test_pos_ratio': 0.019267822736030827, 'test_epoch': 3, 'test_macro_f1': 0.03969043138596641, 'test_micro_f1': 0.03969171483622351}
+loss tensor(1.3232, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+{'train_auc': 0.5273301444294803, 'train_f1': 0.03944884862212156, 'train_pos_ratio': 0.019042412646348685, 'train_epoch': 4, 'train_macro_f1': 0.07155181312656056, 'train_micro_f1': 0.07266183772948841, 'val_auc': 0.5183559457302473, 'val_f1': 0.03824701195219123, 'val_pos_ratio': 0.018794048551292093, 'val_epoch': 4, 'val_macro_f1': 0.054535361249382755, 'val_micro_f1': 0.0548159749412686, 'test_auc': 0.5192534381139489, 'test_f1': 0.03926187671770711, 'test_pos_ratio': 0.019267822736030827, 'test_epoch': 4, 'test_macro_f1': 0.05671001516551265, 'test_micro_f1': 0.05703275529865126}
+loss tensor(1.2518, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+{'train_auc': 0.8212112731387919, 'train_f1': 0.10402684563758388, 'train_pos_ratio': 0.019042412646348685, 'train_epoch': 5, 'train_macro_f1': 0.45600744837613, 'train_micro_f1': 0.6837501708350416, 'val_auc': 0.7311119978717745, 'val_f1': 0.07858546168958744, 'val_pos_ratio': 0.018794048551292093, 'val_epoch': 5, 'val_macro_f1': 0.42462280419442694, 'val_micro_f1': 0.6327329678935004, 'test_auc': 0.7617681728880157, 'test_f1': 0.0832579185520362, 'test_pos_ratio': 0.019267822736030827, 'test_epoch': 5, 'test_macro_f1': 0.4176387511976828, 'test_micro_f1': 0.6096339113680154}
+loss tensor(1.0623, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+{'train_auc': 0.886008112173215, 'train_f1': 0.22642660970399756, 'train_pos_ratio': 0.019042412646348685, 'train_epoch': 6, 'train_macro_f1': 0.5820133048519988, 'train_micro_f1': 0.8845155118217849, 'val_auc': 0.8020583931896781, 'val_f1': 0.1366906474820144, 'val_pos_ratio': 0.018794048551292093, 'val_epoch': 6, 'val_macro_f1': 0.5156212464123604, 'val_micro_f1': 0.8120595144870792, 'test_auc': 0.819607072691552, 'test_f1': 0.1393034825870647, 'test_pos_ratio': 0.019267822736030827, 'test_epoch': 6, 'test_macro_f1': 0.513078817814134, 'test_micro_f1': 0.8000000000000002}
+loss tensor(0.8113, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+{'train_auc': 0.9523946442947145, 'train_f1': 0.35992907801418444, 'train_pos_ratio': 0.019042412646348685, 'train_epoch': 7, 'train_macro_f1': 0.6626279400540115, 'train_micro_f1': 0.9342171199489773, 'val_auc': 0.8708599361532322, 'val_f1': 0.19811320754716982, 'val_pos_ratio': 0.018794048551292093, 'val_epoch': 7, 'val_macro_f1': 0.5627628377616293, 'val_micro_f1': 0.8668754894283477, 'test_auc': 0.8777013752455796, 'test_f1': 0.19438444924406048, 'test_pos_ratio': 0.019267822736030827, 'test_epoch': 7, 'test_macro_f1': 0.5577380253413025, 'test_micro_f1': 0.85626204238921}
+loss tensor(0.4013, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(2.7141, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(4.4579, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(3.0369, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.8672, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+{'train_auc': 0.9584591092741374, 'train_f1': 0.31847619047619047, 'train_pos_ratio': 0.019042412646348685, 'train_epoch': 12, 'train_macro_f1': 0.6375674311878978, 'train_micro_f1': 0.9185002961140722, 'val_auc': 0.9333599361532323, 'val_f1': 0.22325581395348837, 'val_pos_ratio': 0.018794048551292093, 'val_epoch': 12, 'val_macro_f1': 0.575928890302952, 'val_micro_f1': 0.8692247454972593, 'test_auc': 0.9126129666011787, 'test_f1': 0.21768707482993202, 'test_pos_ratio': 0.019267822736030827, 'test_epoch': 12, 'test_macro_f1': 0.5725201009020159, 'test_micro_f1': 0.8670520231213873}
+loss tensor(0.4577, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.5125, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.8782, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(1.1071, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.7873, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.8033, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.7857, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+{'train_auc': 0.9729020573073887, 'train_f1': 0.41737393909136294, 'train_pos_ratio': 0.019042412646348685, 'train_epoch': 19, 'train_macro_f1': 0.6947606228548296, 'train_micro_f1': 0.946836135028017, 'val_auc': 0.9509177972865124, 'val_f1': 0.2807017543859649, 'val_pos_ratio': 0.018794048551292093, 'val_epoch': 19, 'val_macro_f1': 0.6145430719055296, 'val_micro_f1': 0.9036805011746281, 'test_auc': 0.9169548133595284, 'test_f1': 0.25613079019073565, 'test_pos_ratio': 0.019267822736030827, 'test_epoch': 19, 'test_macro_f1': 0.599763508302915, 'test_micro_f1': 0.8947976878612717}
+loss tensor(0.6350, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.5596, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.6475, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.5937, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.5447, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.4477, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.4012, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.3864, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+{'train_auc': 0.9753169553708262, 'train_f1': 0.440231700895208, 'train_pos_ratio': 0.019042412646348685, 'train_epoch': 27, 'train_macro_f1': 0.7074619923898462, 'train_micro_f1': 0.9515739601840463, 'val_auc': 0.9529130087789306, 'val_f1': 0.2891566265060241, 'val_pos_ratio': 0.018794048551292093, 'val_epoch': 27, 'val_macro_f1': 0.6198714455813202, 'val_micro_f1': 0.9075959279561472, 'test_auc': 0.9299017681728879, 'test_f1': 0.2719546742209632, 'test_pos_ratio': 0.019267822736030827, 'test_epoch': 27, 'test_macro_f1': 0.6094112837716352, 'test_micro_f1': 0.9009633911368016}
+loss tensor(0.3353, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+{'train_auc': 0.975595597455069, 'train_f1': 0.4430312665606783, 'train_pos_ratio': 0.019042412646348685, 'train_epoch': 28, 'train_macro_f1': 0.7090081954605129, 'train_micro_f1': 0.9521206323174343, 'val_auc': 0.9533120510774142, 'val_f1': 0.2909090909090909, 'val_pos_ratio': 0.018794048551292093, 'val_epoch': 28, 'val_macro_f1': 0.6209673123025989, 'val_micro_f1': 0.9083790133124511, 'test_auc': 0.9304911591355599, 'test_f1': 0.2742857142857143, 'test_pos_ratio': 0.019267822736030827, 'test_epoch': 28, 'test_macro_f1': 0.6109031877213695, 'test_micro_f1': 0.9021194605009634}
+loss tensor(1.3137, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.4075, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.4226, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss  2%|▏         | 32/2001 [12:53<13:10:22, 24.08s/it]  2%|▏         | 33/2001 [13:17<13:09:58, 24.08s/it]  2%|▏         | 34/2001 [13:41<13:09:20, 24.08s/it]  2%|▏         | 35/2001 [14:05<13:08:36, 24.07s/it]  2%|▏         | 36/2001 [14:29<13:08:16, 24.07s/it]  2%|▏         | 37/2001 [14:53<13:08:40, 24.09s/it]  2%|▏         | 38/2001 [15:17<13:07:31, 24.07s/it]  2%|▏         | 39/2001 [15:41<13:06:24, 24.05s/it]  2%|▏         | 40/2001 [16:05<13:05:41, 24.04s/it]  2%|▏         | 41/2001 [16:29<13:07:33, 24.11s/it]  2%|▏         | 42/2001 [16:53<13:05:46, 24.07s/it]  2%|▏         | 43/2001 [17:17<13:04:24, 24.04s/it]  2%|▏         | 44/2001 [17:41<13:04:03, 24.04s/it]  2%|▏         | 45/2001 [18:05<13:04:58, 24.08s/it]  2%|▏         | 46/2001 [18:29<13:03:43, 24.05s/it]  2%|▏         | 47/2001 [18:53<13:02:54, 24.04s/it]  2%|▏         | 48/2001 [19:18<13:02:42, 24.05s/it]  2%|▏         | 49/2001 [19:42<13:03:25, 24.08s/it]  2%|▏         | 50/2001 [20:06<13:02:07, 24.05s/it]  3%|▎         | 51/2001 [20:30<13:01:11, 24.04s/it]  3%|▎         | 52/2001 [20:54<13:01:04, 24.05s/it]  3%|▎         | 53/2001 [21:18<13:01:44, 24.08s/it]  3%|▎         | 54/2001 [21:42<13:00:39, 24.06s/it]  3%|▎         | 55/2001 [22:06<12:59:38, 24.04s/it]  3%|▎         | 56/2001 [22:30<13:00:22, 24.07s/it]  3%|▎         | 57/2001 [22:54<13:01:02, 24.11s/it]  3%|▎         | 58/2001 [23:18<12:59:28, 24.07s/it]  3%|▎         | 59/2001 [23:42<12:58:41, 24.06s/it]  3%|▎         | 60/2001 [24:06<12:58:06, 24.05s/it]  3%|▎         | 61/2001 [24:30<12:59:02, 24.09s/it]  3%|▎         | 62/2001 [24:55<12:59:49, 24.13s/it]  3%|▎         | 63/2001 [25:19<12:58:13, 24.09s/it]  3%|▎         | 64/2001 [25:43<12:57:28, 24.08s/it]  3%|▎         | 65/2001 [26:07<12:57:45, 24.10s/it]  3%|▎         | 66/2001 [26:31<12:55:58, 24.06s/it]  3%|▎         | 67/2001 [26:55<12:55:25, 24.06s/it]  3%|▎         | 68/2001 [27:19<12:54:50, 24.05s/it]  3%|▎         | 69/2001 [27:43<12:55:24, 24.08s/it]  3%|▎         | 70/2001 [28:07<12:53:33, 24.04s/it]  4%|▎         | 71/2001 [28:31<12:52:30, 24.02s/it]  4%|▎         | 72/2001 [28:50<11:59:18, 22.37s/it]  4%|▎         | 73/2001 [28:56<9:28:57, 17.71s/it]   4%|▎         | 74/2001 [29:01<7:25:59, 13.89s/it]  4%|▎         | 75/2001 [29:06<5:56:51, 11.12s/it]  4%|▍         | 76/2001 [29:11<4:59:39,  9.34s/it]  4%|▍         | 77/2001 [29:16<4:19:42,  8.10s/it]  4%|▍         | 78/2001 [29:21<3:49:04,  7.15s/it]  4%|▍         | 79/2001 [29:26<3:26:55,  6.46s/it]  4%|▍         | 80/2001 [29:31<3:12:46,  6.02s/it]  4%|▍         | 81/2001 [29:36<3:01:38,  5.68s/it]  4%|▍         | 82/2001 [29:41<2:55:33,  5.49s/it]  4%|▍         | 83/2001 [29:46<2:50:29,  5.33s/it]  4%|▍         | 84/2001 [29:51<2:46:58,  5.23s/it]  4%|▍         | 85/2001 [29:56<2:46:13,  5.21s/it]  4%|▍         | 86/2001 [30:01<2:38:19,  4.96s/it]  4%|▍         | 87/2001 [30:06<2:40:18,  5.03s/it]  4%|▍         | 88/2001 [30:11<2:39:57,  5.02s/it]  4%|▍         | 89/2001 [30:16<2:41:34,  5.07s/it]  4%|▍         | 90/2001 [30:21<2:44:06,  5.15s/it]  5%|▍         | 91/2001 [30:26<2:41:30,  5.07s/it]  5%|▍         | 92/2001 [30:31<2:41:18,  5.07s/it]  5%|▍         | 93/2001 [30:36<2:38:34,  4.99s/it]  5%|▍         | 94/2001 [30:41<2:42:07,  5.10s/it]  5%|▍         | 95/2001 [30:49<3:03:30,  5.78s/it]  5%|▍         | 96/2001 [31:00<3:56:50,  7.46s/it]  5%|▍         | 97/2001 [31:11<4:24:52,  8.35s/it]  5%|▍         | 98/2001 [31:21<4:45:37,  9.01s/it]  5%|▍         | 99/2001 [31:31<4:52:56,  9.24s/it]  5%|▍         | 100/2001 [31:41<5:02:42,  9.55s/it]  5%|▌         | 101/2001 [31:51<5:08:24,  9.74s/it]  5%|▌         | 102/2001 [32:02<5:13:35,  9.91s/it]  5%|▌         | 103/2001 [32:12<5:13:12,  9.90s/it]  5%|▌         | 104/2001 [32:22<5:14:50,  9.96s/it]  5%|▌         | 105/2001 [32:32<5:13:44,  9.93s/it]  5%|▌         | 106/2001 [32:42<5:14:08,  9.95s/it]  5%|▌         | 107/2001 [32:52<5:15:54, 10.01s/it]  5%|▌         | 108/2001 [33:02<5:14:20,  9.96s/it]  5%|▌         | 109/2001 [33:11<5:09:44,  9.82s/it]  5%|▌         | 110/2001 [33:21<5:11:06,  9.87s/it]  6%|▌         | 111/2001 [33:31<5:10:30,  9.86s/it]  6%|▌         | 112/2001 [33:40<5:07:05,  9.75s/it]  6%|▌         | 113/2001 [33:50<5:07:43,  9.78s/it]  6%|▌         | 114/2001 [34:00<5:06:29,  9.75s/it]  6%|▌         | 115/2001 [34:10<5:12:01,  9.93s/it]  6%|▌         | 116/2001 [34:21<5:16:11, 10.06s/it]  6%|▌         | 117/2001 [34:30<5:09:27,  9.86s/it]  6%|▌         | 118/2001 [34:39<5:00:52,  9.59s/it]  6%|▌         | 119/2001 [34:48<4:58:19,  9.51s/it]  6%|▌         | 120/2001 [34:58<4:58:03,  9.51s/it]  6%|▌         | 121/2001 [35:08<5:00:58,  9.61s/it]  6%|▌         | 122/2001 [35:18<5:06:53,  9.80s/it]  6%|▌         | 123/2001 [35:28<5:09:37,  9.89s/it] tensor(0.4842, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.4442, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.5114, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.3731, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.4424, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.4506, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.4347, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.3492, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.3865, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.3346, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.3259, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.3215, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.3022, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.3480, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2790, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.3335, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.3461, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2934, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.3353, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.3566, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.3998, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2686, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2798, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+{'train_auc': 0.9753169553708262, 'train_f1': 0.440231700895208, 'train_pos_ratio': 0.019042412646348685, 'train_epoch': 54, 'train_macro_f1': 0.7074619923898462, 'train_micro_f1': 0.9515739601840463, 'val_auc': 0.9549082202713487, 'val_f1': 0.2981366459627329, 'val_pos_ratio': 0.018794048551292093, 'val_epoch': 54, 'val_macro_f1': 0.6254577922667822, 'val_micro_f1': 0.9115113547376663, 'test_auc': 0.9295088408644401, 'test_f1': 0.27042253521126763, 'test_pos_ratio': 0.019267822736030827, 'test_epoch': 54, 'test_macro_f1': 0.6084273999737828, 'test_micro_f1': 0.9001926782273603}
+loss tensor(0.2566, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+{'train_auc': 0.9759671202340593, 'train_f1': 0.44681988241582044, 'train_pos_ratio': 0.019042412646348685, 'train_epoch': 55, 'train_macro_f1': 0.7110976003166632, 'train_micro_f1': 0.9528495284952849, 'val_auc': 0.9553072625698323, 'val_f1': 0.3, 'val_pos_ratio': 0.018794048551292093, 'val_epoch': 55, 'val_macro_f1': 0.6266081871345028, 'val_micro_f1': 0.9122944400939702, 'test_auc': 0.9297053045186641, 'test_f1': 0.27118644067796605, 'test_pos_ratio': 0.019267822736030827, 'test_epoch': 55, 'test_macro_f1': 0.6089182823737225, 'test_micro_f1': 0.900578034682081}
+loss tensor(0.2886, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.3056, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.3581, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2897, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2738, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2546, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2825, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2705, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2875, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2994, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2631, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2393, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2460, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2145, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2185, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2380, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.4131, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2828, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2406, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2290, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2318, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2380, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2235, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2478, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2274, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2464, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2288, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2276, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2220, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2273, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2201, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2104, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2257, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2792, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2147, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2074, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2124, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2133, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2191, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2128, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2210, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2073, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2089, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2137, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2226, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2091, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1985, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2415, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2229, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2022, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2125, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2026, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2107, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2171, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2071, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2035, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2050, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2234, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2121, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2156, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2160, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2033, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2094, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2045, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2096, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2086, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2035, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1988, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss   6%|▌         | 124/2001 [35:38<5:12:11,  9.98s/it]  6%|▌         | 125/2001 [35:48<5:10:42,  9.94s/it]  6%|▋         | 126/2001 [35:59<5:18:39, 10.20s/it]  6%|▋         | 127/2001 [36:08<5:10:28,  9.94s/it]  6%|▋         | 128/2001 [36:18<5:07:44,  9.86s/it]  6%|▋         | 129/2001 [36:28<5:09:05,  9.91s/it]  6%|▋         | 130/2001 [36:38<5:10:15,  9.95s/it]  7%|▋         | 131/2001 [36:48<5:08:40,  9.90s/it]  7%|▋         | 132/2001 [36:58<5:11:57, 10.01s/it]  7%|▋         | 133/2001 [37:08<5:12:12, 10.03s/it]  7%|▋         | 134/2001 [37:17<5:05:33,  9.82s/it]  7%|▋         | 135/2001 [37:28<5:09:18,  9.95s/it]  7%|▋         | 136/2001 [37:38<5:15:41, 10.16s/it]  7%|▋         | 137/2001 [37:48<5:16:03, 10.17s/it]  7%|▋         | 138/2001 [37:58<5:12:09, 10.05s/it]  7%|▋         | 139/2001 [38:08<5:08:51,  9.95s/it]  7%|▋         | 140/2001 [38:18<5:10:33, 10.01s/it]  7%|▋         | 141/2001 [38:28<5:08:28,  9.95s/it]  7%|▋         | 142/2001 [38:38<5:10:03, 10.01s/it]  7%|▋         | 143/2001 [38:48<5:11:39, 10.06s/it]  7%|▋         | 144/2001 [38:59<5:15:13, 10.18s/it]  7%|▋         | 145/2001 [39:08<5:11:32, 10.07s/it]  7%|▋         | 146/2001 [39:15<4:37:23,  8.97s/it]  7%|▋         | 147/2001 [39:21<4:08:30,  8.04s/it]  7%|▋         | 148/2001 [39:27<3:47:53,  7.38s/it]  7%|▋         | 149/2001 [39:32<3:33:54,  6.93s/it]  7%|▋         | 150/2001 [39:40<3:37:20,  7.04s/it]  8%|▊         | 151/2001 [39:47<3:35:29,  6.99s/it]  8%|▊         | 152/2001 [39:54<3:34:53,  6.97s/it]  8%|▊         | 153/2001 [40:01<3:36:02,  7.01s/it]  8%|▊         | 154/2001 [40:08<3:35:03,  6.99s/it]  8%|▊         | 155/2001 [40:15<3:35:22,  7.00s/it]  8%|▊         | 156/2001 [40:22<3:36:33,  7.04s/it]  8%|▊         | 157/2001 [40:29<3:35:12,  7.00s/it]  8%|▊         | 158/2001 [40:36<3:34:39,  6.99s/it]  8%|▊         | 159/2001 [40:43<3:34:16,  6.98s/it]  8%|▊         | 160/2001 [40:49<3:32:49,  6.94s/it]  8%|▊         | 161/2001 [40:56<3:33:53,  6.97s/it]  8%|▊         | 162/2001 [41:03<3:31:28,  6.90s/it]  8%|▊         | 163/2001 [41:10<3:30:50,  6.88s/it]  8%|▊         | 164/2001 [41:17<3:30:27,  6.87s/it]  8%|▊         | 165/2001 [41:24<3:30:42,  6.89s/it]  8%|▊         | 166/2001 [41:31<3:30:58,  6.90s/it]  8%|▊         | 167/2001 [41:38<3:31:38,  6.92s/it]  8%|▊         | 168/2001 [41:45<3:33:04,  6.97s/it]  8%|▊         | 169/2001 [41:52<3:32:10,  6.95s/it]  8%|▊         | 170/2001 [41:59<3:32:53,  6.98s/it]  9%|▊         | 171/2001 [42:06<3:32:39,  6.97s/it]  9%|▊         | 172/2001 [42:13<3:32:17,  6.96s/it]  9%|▊         | 173/2001 [42:20<3:33:52,  7.02s/it]  9%|▊         | 174/2001 [42:27<3:33:18,  7.01s/it]  9%|▊         | 175/2001 [42:34<3:33:09,  7.00s/it]  9%|▉         | 176/2001 [42:41<3:33:36,  7.02s/it]  9%|▉         | 177/2001 [42:48<3:33:36,  7.03s/it]  9%|▉         | 178/2001 [42:55<3:34:00,  7.04s/it]  9%|▉         | 179/2001 [43:02<3:32:53,  7.01s/it]  9%|▉         | 180/2001 [43:09<3:32:44,  7.01s/it]  9%|▉         | 181/2001 [43:16<3:32:14,  7.00s/it]  9%|▉         | 182/2001 [43:23<3:31:52,  6.99s/it]  9%|▉         | 183/2001 [43:30<3:32:32,  7.01s/it]  9%|▉         | 184/2001 [43:37<3:33:09,  7.04s/it]  9%|▉         | 185/2001 [43:44<3:31:55,  7.00s/it]  9%|▉         | 186/2001 [43:51<3:32:49,  7.04s/it]  9%|▉         | 187/2001 [43:58<3:32:18,  7.02s/it]  9%|▉         | 188/2001 [44:05<3:31:15,  6.99s/it]  9%|▉         | 189/2001 [44:12<3:30:32,  6.97s/it]  9%|▉         | 190/2001 [44:19<3:30:16,  6.97s/it] 10%|▉         | 191/2001 [44:26<3:30:58,  6.99s/it] 10%|▉         | 192/2001 [44:33<3:30:57,  7.00s/it] 10%|▉         | 193/2001 [44:40<3:31:43,  7.03s/it] 10%|▉         | 194/2001 [44:47<3:31:11,  7.01s/it] 10%|▉         | 195/2001 [44:54<3:30:52,  7.01s/it] 10%|▉         | 196/2001 [45:01<3:32:32,  7.07s/it] 10%|▉         | 197/2001 [45:08<3:31:17,  7.03s/it] 10%|▉         | 198/2001 [45:15<3:32:37,  7.08s/it] 10%|▉         | 199/2001 [45:22<3:31:09,  7.03s/it] 10%|▉         | 200/2001 [45:29<3:30:06,  7.00s/it] 10%|█         | 201/2001 [45:36<3:30:33,  7.02s/it] 10%|█         | 202/2001 [45:43<3:30:32,  7.02s/it] 10%|█         | 203/2001 [45:50<3:31:05,  7.04s/it] 10%|█         | 204/2001 [45:57<3:30:27,  7.03s/it] 10%|█         | 205/2001 [46:04<3:30:53,  7.05s/it] 10%|█         | 206/2001 [46:11<3:30:22,  7.03s/it] 10%|█         | 207/2001 [46:18<3:29:50,  7.02s/it] 10%|█         | 208/2001 [46:25<3:30:26,  7.04s/it] 10%|█         | 209/2001 [46:33<3:30:28,  7.05s/it] 10%|█         | 210/2001 [46:39<3:29:18,  7.01s/it] 11%|█         | 211/2001 [46:47<3:29:44,  7.03s/it] 11%|█         | 212/2001 [46:53<3:28:48,  7.00s/it] 11%|█         | 213/2001 [47:01<3:30:08,  7.05s/it] 11%|█         | 214/2001 [47:08<3:28:54,  7.01s/it] 11%|█         | 215/2001 [47:15<3:28:21,  7.00s/it]tensor(0.2340, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2015, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2071, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2029, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2044, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2095, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2092, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2100, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2122, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1984, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2024, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2064, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2119, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2013, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2079, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1991, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2115, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1944, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2008, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1986, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1985, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1969, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1989, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2101, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2050, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1997, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1954, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1948, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2135, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1969, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1899, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1946, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1942, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2088, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1975, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1925, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1965, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1928, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2012, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2216, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1898, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1894, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1930, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1909, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2072, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2081, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1979, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2024, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1960, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1997, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2004, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1907, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2004, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1932, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1989, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1884, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1891, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1908, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+{'train_auc': 0.9765708447499187, 'train_f1': 0.45311653116531164, 'train_pos_ratio': 0.019042412646348685, 'train_epoch': 181, 'train_macro_f1': 0.7145626405975166, 'train_micro_f1': 0.9540339847842922, 'val_auc': 0.955706304868316, 'val_f1': 0.3018867924528302, 'val_pos_ratio': 0.018794048551292093, 'val_epoch': 181, 'val_macro_f1': 0.6277701185646196, 'val_micro_f1': 0.9130775254502741, 'test_auc': 0.9314734774066797, 'test_f1': 0.27826086956521734, 'test_pos_ratio': 0.019267822736030827, 'test_epoch': 181, 'test_macro_f1': 0.6134338403553641, 'test_micro_f1': 0.9040462427745665}
+loss tensor(0.1958, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+{'train_auc': 0.9765708447499187, 'train_f1': 0.45311653116531164, 'train_pos_ratio': 0.019042412646348685, 'train_epoch': 182, 'train_macro_f1': 0.7145626405975166, 'train_micro_f1': 0.9540339847842922, 'val_auc': 0.9561053471667997, 'val_f1': 0.30379746835443033, 'val_pos_ratio': 0.018794048551292093, 'val_epoch': 182, 'val_macro_f1': 0.6289438093024238, 'val_micro_f1': 0.9138606108065779, 'test_auc': 0.9316699410609037, 'test_f1': 0.27906976744186046, 'test_pos_ratio': 0.019267822736030827, 'test_epoch': 182, 'test_macro_f1': 0.6139467698125521, 'test_micro_f1': 0.9044315992292871}
+loss tensor(0.1916, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1989, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1869, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1973, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2024, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1824, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1900, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1892, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1879, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1912, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1869, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1931, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1900, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1836, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1839, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1864, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1852, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1848, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1845, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1928, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1903, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1805, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1818, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1827, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1886, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1865, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1870, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1846, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1828, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1927, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1844, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1922, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1880, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss  11%|█         | 216/2001 [47:22<3:29:25,  7.04s/it] 11%|█         | 217/2001 [47:29<3:29:43,  7.05s/it] 11%|█         | 218/2001 [47:36<3:29:42,  7.06s/it] 11%|█         | 219/2001 [47:43<3:29:01,  7.04s/it] 11%|█         | 220/2001 [47:50<3:28:27,  7.02s/it] 11%|█         | 221/2001 [47:57<3:29:19,  7.06s/it] 11%|█         | 222/2001 [48:04<3:28:40,  7.04s/it] 11%|█         | 223/2001 [48:11<3:28:41,  7.04s/it] 11%|█         | 224/2001 [48:18<3:28:35,  7.04s/it] 11%|█         | 225/2001 [48:25<3:28:39,  7.05s/it] 11%|█▏        | 226/2001 [48:32<3:29:25,  7.08s/it] 11%|█▏        | 227/2001 [48:39<3:28:03,  7.04s/it] 11%|█▏        | 228/2001 [48:46<3:29:28,  7.09s/it] 11%|█▏        | 229/2001 [48:53<3:27:53,  7.04s/it] 11%|█▏        | 230/2001 [49:00<3:27:17,  7.02s/it] 12%|█▏        | 231/2001 [49:07<3:27:37,  7.04s/it] 12%|█▏        | 232/2001 [49:14<3:27:30,  7.04s/it] 12%|█▏        | 233/2001 [49:21<3:27:32,  7.04s/it] 12%|█▏        | 234/2001 [49:29<3:27:27,  7.04s/it] 12%|█▏        | 235/2001 [49:36<3:27:06,  7.04s/it] 12%|█▏        | 236/2001 [49:43<3:27:52,  7.07s/it] 12%|█▏        | 237/2001 [49:50<3:26:53,  7.04s/it] 12%|█▏        | 238/2001 [49:57<3:27:38,  7.07s/it] 12%|█▏        | 239/2001 [50:04<3:26:42,  7.04s/it] 12%|█▏        | 240/2001 [50:11<3:27:48,  7.08s/it] 12%|█▏        | 241/2001 [50:18<3:27:36,  7.08s/it] 12%|█▏        | 242/2001 [50:25<3:26:51,  7.06s/it] 12%|█▏        | 243/2001 [50:32<3:26:30,  7.05s/it] 12%|█▏        | 244/2001 [50:39<3:26:38,  7.06s/it] 12%|█▏        | 245/2001 [50:46<3:26:05,  7.04s/it] 12%|█▏        | 246/2001 [50:53<3:26:05,  7.05s/it] 12%|█▏        | 247/2001 [51:00<3:25:12,  7.02s/it] 12%|█▏        | 248/2001 [51:07<3:25:19,  7.03s/it] 12%|█▏        | 249/2001 [51:14<3:24:42,  7.01s/it] 12%|█▏        | 250/2001 [51:21<3:26:53,  7.09s/it] 13%|█▎        | 251/2001 [51:28<3:25:43,  7.05s/it] 13%|█▎        | 252/2001 [51:36<3:26:12,  7.07s/it] 13%|█▎        | 253/2001 [51:43<3:25:55,  7.07s/it] 13%|█▎        | 254/2001 [51:50<3:25:46,  7.07s/it] 13%|█▎        | 255/2001 [51:57<3:26:06,  7.08s/it] 13%|█▎        | 256/2001 [52:04<3:25:38,  7.07s/it] 13%|█▎        | 257/2001 [52:11<3:25:23,  7.07s/it] 13%|█▎        | 258/2001 [52:18<3:27:21,  7.14s/it] 13%|█▎        | 259/2001 [52:25<3:26:45,  7.12s/it] 13%|█▎        | 260/2001 [52:32<3:27:19,  7.15s/it] 13%|█▎        | 261/2001 [52:40<3:26:21,  7.12s/it] 13%|█▎        | 262/2001 [52:47<3:25:41,  7.10s/it] 13%|█▎        | 263/2001 [52:54<3:24:54,  7.07s/it] 13%|█▎        | 264/2001 [53:00<3:22:50,  7.01s/it] 13%|█▎        | 265/2001 [53:08<3:23:42,  7.04s/it] 13%|█▎        | 266/2001 [53:15<3:23:09,  7.03s/it] 13%|█▎        | 267/2001 [53:22<3:23:11,  7.03s/it] 13%|█▎        | 268/2001 [53:29<3:22:37,  7.02s/it] 13%|█▎        | 269/2001 [53:36<3:22:13,  7.01s/it] 13%|█▎        | 270/2001 [53:43<3:23:52,  7.07s/it] 14%|█▎        | 271/2001 [53:50<3:23:16,  7.05s/it] 14%|█▎        | 272/2001 [53:57<3:23:15,  7.05s/it] 14%|█▎        | 273/2001 [54:04<3:23:20,  7.06s/it] 14%|█▎        | 274/2001 [54:11<3:23:11,  7.06s/it] 14%|█▎        | 275/2001 [54:18<3:24:12,  7.10s/it] 14%|█▍        | 276/2001 [54:25<3:24:26,  7.11s/it] 14%|█▍        | 277/2001 [54:32<3:23:43,  7.09s/it] 14%|█▍        | 278/2001 [54:40<3:24:33,  7.12s/it] 14%|█▍        | 279/2001 [54:46<3:22:00,  7.04s/it] 14%|█▍        | 280/2001 [54:53<3:22:12,  7.05s/it] 14%|█▍        | 281/2001 [55:00<3:21:28,  7.03s/it] 14%|█▍        | 282/2001 [55:08<3:22:55,  7.08s/it] 14%|█▍        | 283/2001 [55:15<3:22:30,  7.07s/it] 14%|█▍        | 284/2001 [55:22<3:21:57,  7.06s/it] 14%|█▍        | 285/2001 [55:29<3:21:55,  7.06s/it] 14%|█▍        | 286/2001 [55:36<3:21:36,  7.05s/it] 14%|█▍        | 287/2001 [55:43<3:20:58,  7.04s/it] 14%|█▍        | 288/2001 [55:50<3:21:21,  7.05s/it] 14%|█▍        | 289/2001 [55:57<3:20:42,  7.03s/it] 14%|█▍        | 290/2001 [56:04<3:22:11,  7.09s/it] 15%|█▍        | 291/2001 [56:11<3:20:35,  7.04s/it] 15%|█▍        | 292/2001 [56:18<3:21:03,  7.06s/it] 15%|█▍        | 293/2001 [56:25<3:20:32,  7.05s/it] 15%|█▍        | 294/2001 [56:32<3:19:34,  7.01s/it] 15%|█▍        | 295/2001 [56:39<3:19:22,  7.01s/it] 15%|█▍        | 296/2001 [56:46<3:19:25,  7.02s/it] 15%|█▍        | 297/2001 [56:53<3:19:27,  7.02s/it] 15%|█▍        | 298/2001 [57:00<3:20:33,  7.07s/it] 15%|█▍        | 299/2001 [57:07<3:19:13,  7.02s/it]tensor(0.1881, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1856, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1788, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1815, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1826, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1826, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1713, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1804, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1866, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1830, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1757, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1853, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1750, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1772, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1795, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1757, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1779, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1837, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1771, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1738, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1864, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1795, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1748, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1720, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1815, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1690, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1717, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1742, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1667, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+{'train_auc': 0.9776854130868898, 'train_f1': 0.4652198107957707, 'train_pos_ratio': 0.019042412646348685, 'train_epoch': 244, 'train_macro_f1': 0.7211979590732207, 'train_micro_f1': 0.9562206733178443, 'val_auc': 0.9565043894652834, 'val_f1': 0.3057324840764331, 'val_pos_ratio': 0.018794048551292093, 'val_epoch': 244, 'val_macro_f1': 0.6301294877620379, 'val_micro_f1': 0.9146436961628818, 'test_auc': 0.930687622789784, 'test_f1': 0.27507163323782235, 'test_pos_ratio': 0.019267822736030827, 'test_epoch': 244, 'test_macro_f1': 0.6114048519421915, 'test_micro_f1': 0.902504816955684}
+loss tensor(0.1630, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1759, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1693, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1741, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1759, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1637, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1668, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1688, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1624, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1718, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1632, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1596, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1630, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1659, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1542, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1607, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+{'train_auc': 0.9784284586448706, 'train_f1': 0.47365439093484424, 'train_pos_ratio': 0.019042412646348685, 'train_epoch': 260, 'train_macro_f1': 0.725803629480285, 'train_micro_f1': 0.9576784656735458, 'val_auc': 0.956903431763767, 'val_f1': 0.3076923076923077, 'val_pos_ratio': 0.018794048551292093, 'val_epoch': 260, 'val_macro_f1': 0.6313273882081221, 'val_micro_f1': 0.9154267815191856, 'test_auc': 0.8918664047151277, 'test_f1': 0.25958702064896755, 'test_pos_ratio': 0.019267822736030827, 'test_epoch': 260, 'test_macro_f1': 0.6039225558821009, 'test_micro_f1': 0.9032755298651253}
+loss tensor(0.1617, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1633, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1560, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1668, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1528, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+{'train_auc': 0.9789393024659824, 'train_f1': 0.47963281698221455, 'train_pos_ratio': 0.019042412646348685, 'train_epoch': 265, 'train_macro_f1': 0.7290595119802792, 'train_micro_f1': 0.9586806979180903, 'val_auc': 0.9577015163607343, 'val_f1': 0.3116883116883117, 'val_pos_ratio': 0.018794048551292093, 'val_epoch': 265, 'val_macro_f1': 0.6337608225108224, 'val_micro_f1': 0.9169929522317932, 'test_auc': 0.8728487229862475, 'test_f1': 0.25301204819277107, 'test_pos_ratio': 0.019267822736030827, 'test_epoch': 265, 'test_macro_f1': 0.6009811167270978, 'test_micro_f1': 0.9044315992292871}
+loss tensor(0.1568, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1508, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1562, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1563, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1713, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1514, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1565, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1639, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1581, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1598, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1481, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1633, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1467, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1481, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1475, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1508, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1467, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1451, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1399, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1428, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1361, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1422, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1418, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1415, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1341, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1367, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1324, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1438, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1319, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1312, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1432, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1370, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1383, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1349, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss  15%|█▍        | 300/2001 [57:14<3:19:42,  7.04s/it] 15%|█▌        | 301/2001 [57:21<3:18:24,  7.00s/it] 15%|█▌        | 302/2001 [57:29<3:20:25,  7.08s/it] 15%|█▌        | 303/2001 [57:36<3:20:05,  7.07s/it] 15%|█▌        | 304/2001 [57:43<3:20:22,  7.08s/it] 15%|█▌        | 305/2001 [57:50<3:19:30,  7.06s/it] 15%|█▌        | 306/2001 [57:57<3:19:29,  7.06s/it] 15%|█▌        | 307/2001 [58:04<3:19:13,  7.06s/it] 15%|█▌        | 308/2001 [58:11<3:19:38,  7.08s/it] 15%|█▌        | 309/2001 [58:18<3:18:29,  7.04s/it] 15%|█▌        | 310/2001 [58:25<3:18:31,  7.04s/it] 16%|█▌        | 311/2001 [58:32<3:18:07,  7.03s/it] 16%|█▌        | 312/2001 [58:39<3:18:55,  7.07s/it] 16%|█▌        | 313/2001 [58:46<3:18:43,  7.06s/it] 16%|█▌        | 314/2001 [58:53<3:18:24,  7.06s/it] 16%|█▌        | 315/2001 [59:00<3:18:06,  7.05s/it] 16%|█▌        | 316/2001 [59:07<3:18:36,  7.07s/it] 16%|█▌        | 317/2001 [59:14<3:18:43,  7.08s/it] 16%|█▌        | 318/2001 [59:21<3:18:27,  7.08s/it] 16%|█▌        | 319/2001 [59:28<3:17:31,  7.05s/it] 16%|█▌        | 320/2001 [59:36<3:18:05,  7.07s/it] 16%|█▌        | 321/2001 [59:43<3:17:32,  7.06s/it] 16%|█▌        | 322/2001 [59:50<3:18:17,  7.09s/it] 16%|█▌        | 323/2001 [59:57<3:16:31,  7.03s/it] 16%|█▌        | 324/2001 [1:00:04<3:17:09,  7.05s/it] 16%|█▌        | 325/2001 [1:00:11<3:17:39,  7.08s/it] 16%|█▋        | 326/2001 [1:00:18<3:17:44,  7.08s/it] 16%|█▋        | 327/2001 [1:00:25<3:17:13,  7.07s/it] 16%|█▋        | 328/2001 [1:00:32<3:15:48,  7.02s/it] 16%|█▋        | 329/2001 [1:00:39<3:15:54,  7.03s/it] 16%|█▋        | 330/2001 [1:00:46<3:16:30,  7.06s/it] 17%|█▋        | 331/2001 [1:00:53<3:15:57,  7.04s/it] 17%|█▋        | 332/2001 [1:01:00<3:16:53,  7.08s/it] 17%|█▋        | 333/2001 [1:01:07<3:15:25,  7.03s/it] 17%|█▋        | 334/2001 [1:01:14<3:15:57,  7.05s/it] 17%|█▋        | 335/2001 [1:01:21<3:16:15,  7.07s/it] 17%|█▋        | 336/2001 [1:01:28<3:15:37,  7.05s/it] 17%|█▋        | 337/2001 [1:01:36<3:15:51,  7.06s/it] 17%|█▋        | 338/2001 [1:01:42<3:14:53,  7.03s/it] 17%|█▋        | 339/2001 [1:01:50<3:14:54,  7.04s/it] 17%|█▋        | 340/2001 [1:01:57<3:14:27,  7.02s/it] 17%|█▋        | 341/2001 [1:02:04<3:14:58,  7.05s/it] 17%|█▋        | 342/2001 [1:02:11<3:15:33,  7.07s/it] 17%|█▋        | 343/2001 [1:02:18<3:15:08,  7.06s/it] 17%|█▋        | 344/2001 [1:02:25<3:15:01,  7.06s/it] 17%|█▋        | 345/2001 [1:02:32<3:14:13,  7.04s/it] 17%|█▋        | 346/2001 [1:02:39<3:13:29,  7.01s/it] 17%|█▋        | 347/2001 [1:02:46<3:13:45,  7.03s/it] 17%|█▋        | 348/2001 [1:02:53<3:12:43,  7.00s/it] 17%|█▋        | 349/2001 [1:03:00<3:13:24,  7.02s/it] 17%|█▋        | 350/2001 [1:03:07<3:13:12,  7.02s/it] 18%|█▊        | 351/2001 [1:03:14<3:13:16,  7.03s/it] 18%|█▊        | 352/2001 [1:03:21<3:12:45,  7.01s/it] 18%|█▊        | 353/2001 [1:03:28<3:12:56,  7.02s/it] 18%|█▊        | 354/2001 [1:03:35<3:13:45,  7.06s/it] 18%|█▊        | 355/2001 [1:03:42<3:14:36,  7.09s/it] 18%|█▊        | 356/2001 [1:03:49<3:13:58,  7.08s/it] 18%|█▊        | 357/2001 [1:03:56<3:14:11,  7.09s/it] 18%|█▊        | 358/2001 [1:04:03<3:12:49,  7.04s/it] 18%|█▊        | 359/2001 [1:04:10<3:13:12,  7.06s/it] 18%|█▊        | 360/2001 [1:04:17<3:11:38,  7.01s/it] 18%|█▊        | 361/2001 [1:04:24<3:12:30,  7.04s/it] 18%|█▊        | 362/2001 [1:04:32<3:12:31,  7.05s/it] 18%|█▊        | 363/2001 [1:04:38<3:11:30,  7.01s/it] 18%|█▊        | 364/2001 [1:04:45<3:11:14,  7.01s/it] 18%|█▊        | 365/2001 [1:04:52<3:11:17,  7.02s/it] 18%|█▊        | 366/2001 [1:04:59<3:10:01,  6.97s/it] 18%|█▊        | 367/2001 [1:05:06<3:10:12,  6.98s/it] 18%|█▊        | 368/2001 [1:05:13<3:09:49,  6.97s/it] 18%|█▊        | 369/2001 [1:05:21<3:11:37,  7.05s/it] 18%|█▊        | 370/2001 [1:05:28<3:11:16,  7.04s/it] 19%|█▊        | 371/2001 [1:05:35<3:11:56,  7.07s/it] 19%|█▊        | 372/2001 [1:05:42<3:11:19,  7.05s/it] 19%|█▊        | 373/2001 [1:05:49<3:11:11,  7.05s/it] 19%|█▊        | 374/2001 [1:05:56<3:11:01,  7.04s/it] 19%|█▊        | 375/2001 [1:06:03<3:11:15,  7.06s/it] 19%|█▉        | 376/2001 [1:06:10<3:10:14,  7.02s/it] 19%|█▉        | 377/2001 [1:06:17<3:09:58,  7.02s/it] 19%|█▉        | 378/2001 [1:06:24<3:09:25,  7.00s/it] 19%|█▉        | 379/2001 [1:06:31<3:09:23,  7.01s/it] 19%|█▉        | 380/2001 [1:06:38<3:09:02,  7.00s/it] 19%|█▉        | 381/2001 [1:06:45<3:09:54,  7.03s/it] 19%|█▉        | 382/2001 [1:06:52<3:10:46,  7.07s/it] 19%|█▉        | 383/2001 [1:06:59<3:09:54,  7.04s/it] 19%|█▉        | 384/2001 [1:07:06<3:09:57,  7.05s/it] 19%|█▉        | 385/2001 [1:07:13<3:09:43,  7.04s/it] 19%|█▉        | 386/2001 [1:07:20<3:09:42,  7.05s/it] 19%|█▉        | 387/2001 [1:07:27<3:10:25,  7.08s/it] 19%|█▉        | 388/2001 [1:07:34<3:09:49,  7.06s/it] 19%|█▉        | 389/2001 [1:07:41<3:09:40,  7.06s/it] 19%|█▉        | 390/2001 [1:07:48<3:08:54,  7.04s/it] 20%|█▉        | 391/2001 [1:07:55<3:08:17,  7.02s/it] 20%|█▉        | 392/2001 [1:08:02<3:08:06,  7.01s/it] 20%|█▉        | 393/2001 [1:08:09<3:07:56,  7.01s/it] 20%|█▉        | 394/2001 [1:08:16<3:08:07,  7.02s/it] 20%|█▉        | 395/2001 [1:08:23<3:07:56,  7.02s/it] 20%|█▉        | 396/2001 [1:08:31<3:08:48,  7.06s/it] 20%|█▉        | 397/2001 [1:08:38<3:09:11,  7.08s/it] 20%|█▉        | 398/2001 [1:08:45<3:09:27,  7.09s/it] 20%|█▉        | 399/2001 [1:08:52<3:10:02,  7.12s/it] 20%|█▉        | 400/2001 [1:08:59<3:10:27,  7.14s/it] 20%|██        | 401/2001 [1:09:06<3:09:39,  7.11s/it] 20%|██        | 402/2001 [1:09:13<3:10:24,  7.14s/it] 20%|██        | 403/2001 [1:09:20<3:08:43,  7.09s/it] 20%|██        | 404/2001 [1:09:27<3:07:28,  7.04s/it] 20%|██        | 405/2001 [1:09:34<3:07:17,  7.04s/it] 20%|██        | 406/2001 [1:09:41<3:06:49,  7.03s/it]tensor(0.1517, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1223, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1273, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1366, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1338, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1248, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1326, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1246, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1192, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1218, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1177, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1252, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1214, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1172, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1164, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1110, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1348, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1172, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1145, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1176, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1207, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1148, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1081, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1067, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1129, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1192, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1161, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1031, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1051, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1164, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1061, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1008, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1042, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1011, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1090, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1033, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1073, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0956, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1070, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0974, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1027, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0960, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0942, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0957, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0962, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0908, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1052, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1017, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0884, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0943, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0910, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0888, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0915, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0841, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0914, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0861, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0867, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0919, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1523, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0934, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1205, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1426, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1331, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1077, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0985, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1188, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1294, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1195, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0985, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1011, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1065, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1117, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0976, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0952, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0988, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0956, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1028, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0949, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0871, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0840, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0864, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0851, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0831, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0867, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0928, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0832, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0803, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0766, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0760, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0774, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0742, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0717, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0828, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0728, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0738, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0718, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0824, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0765, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0715, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0688, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0764, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0706, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0712, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0726, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0772, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0704, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0715, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss  20%|██        | 407/2001 [1:09:49<3:07:44,  7.07s/it] 20%|██        | 408/2001 [1:09:56<3:07:05,  7.05s/it] 20%|██        | 409/2001 [1:10:03<3:08:03,  7.09s/it] 20%|██        | 410/2001 [1:10:10<3:07:43,  7.08s/it] 21%|██        | 411/2001 [1:10:17<3:08:10,  7.10s/it] 21%|██        | 412/2001 [1:10:24<3:08:11,  7.11s/it] 21%|██        | 413/2001 [1:10:31<3:07:35,  7.09s/it] 21%|██        | 414/2001 [1:10:38<3:06:36,  7.06s/it] 21%|██        | 415/2001 [1:10:45<3:06:54,  7.07s/it] 21%|██        | 416/2001 [1:10:52<3:06:48,  7.07s/it] 21%|██        | 417/2001 [1:10:59<3:07:28,  7.10s/it] 21%|██        | 418/2001 [1:11:06<3:05:27,  7.03s/it] 21%|██        | 419/2001 [1:11:13<3:05:17,  7.03s/it] 21%|██        | 420/2001 [1:11:20<3:05:36,  7.04s/it] 21%|██        | 421/2001 [1:11:28<3:06:10,  7.07s/it] 21%|██        | 422/2001 [1:11:35<3:05:24,  7.05s/it] 21%|██        | 423/2001 [1:11:42<3:05:29,  7.05s/it] 21%|██        | 424/2001 [1:11:49<3:05:38,  7.06s/it] 21%|██        | 425/2001 [1:11:56<3:06:07,  7.09s/it] 21%|██▏       | 426/2001 [1:12:03<3:05:20,  7.06s/it] 21%|██▏       | 427/2001 [1:12:10<3:06:16,  7.10s/it] 21%|██▏       | 428/2001 [1:12:17<3:05:41,  7.08s/it] 21%|██▏       | 429/2001 [1:12:24<3:04:49,  7.05s/it] 21%|██▏       | 430/2001 [1:12:31<3:06:36,  7.13s/it] 22%|██▏       | 431/2001 [1:12:38<3:04:42,  7.06s/it] 22%|██▏       | 432/2001 [1:12:45<3:05:31,  7.09s/it] 22%|██▏       | 433/2001 [1:12:52<3:05:16,  7.09s/it] 22%|██▏       | 434/2001 [1:12:59<3:04:00,  7.05s/it] 22%|██▏       | 435/2001 [1:13:06<3:03:50,  7.04s/it] 22%|██▏       | 436/2001 [1:13:13<3:03:31,  7.04s/it] 22%|██▏       | 437/2001 [1:13:21<3:03:59,  7.06s/it] 22%|██▏       | 438/2001 [1:13:28<3:05:22,  7.12s/it] 22%|██▏       | 439/2001 [1:13:35<3:04:05,  7.07s/it] 22%|██▏       | 440/2001 [1:13:42<3:03:59,  7.07s/it] 22%|██▏       | 441/2001 [1:13:49<3:03:45,  7.07s/it] 22%|██▏       | 442/2001 [1:13:56<3:03:11,  7.05s/it] 22%|██▏       | 443/2001 [1:14:03<3:04:41,  7.11s/it] 22%|██▏       | 444/2001 [1:14:10<3:02:57,  7.05s/it] 22%|██▏       | 445/2001 [1:14:17<3:03:35,  7.08s/it] 22%|██▏       | 446/2001 [1:14:24<3:02:33,  7.04s/it] 22%|██▏       | 447/2001 [1:14:31<3:03:18,  7.08s/it] 22%|██▏       | 448/2001 [1:14:38<3:03:21,  7.08s/it] 22%|██▏       | 449/2001 [1:14:45<3:02:31,  7.06s/it] 22%|██▏       | 450/2001 [1:14:53<3:02:35,  7.06s/it] 23%|██▎       | 451/2001 [1:15:00<3:01:38,  7.03s/it] 23%|██▎       | 452/2001 [1:15:07<3:01:36,  7.03s/it] 23%|██▎       | 453/2001 [1:15:14<3:01:50,  7.05s/it] 23%|██▎       | 454/2001 [1:15:21<3:00:38,  7.01s/it] 23%|██▎       | 455/2001 [1:15:28<3:01:10,  7.03s/it] 23%|██▎       | 456/2001 [1:15:35<3:01:28,  7.05s/it] 23%|██▎       | 457/2001 [1:15:42<3:03:04,  7.11s/it] 23%|██▎       | 458/2001 [1:15:49<3:03:29,  7.14s/it] 23%|██▎       | 459/2001 [1:15:56<3:02:05,  7.08s/it] 23%|██▎       | 460/2001 [1:16:03<3:02:23,  7.10s/it] 23%|██▎       | 461/2001 [1:16:10<3:02:25,  7.11s/it] 23%|██▎       | 462/2001 [1:16:17<3:02:05,  7.10s/it] 23%|██▎       | 463/2001 [1:16:25<3:01:58,  7.10s/it] 23%|██▎       | 464/2001 [1:16:32<3:01:46,  7.10s/it] 23%|██▎       | 465/2001 [1:16:39<3:01:36,  7.09s/it] 23%|██▎       | 466/2001 [1:16:46<3:00:31,  7.06s/it] 23%|██▎       | 467/2001 [1:16:53<3:00:05,  7.04s/it] 23%|██▎       | 468/2001 [1:17:00<3:00:20,  7.06s/it] 23%|██▎       | 469/2001 [1:17:07<2:59:45,  7.04s/it] 23%|██▎       | 470/2001 [1:17:14<3:01:18,  7.11s/it] 24%|██▎       | 471/2001 [1:17:21<3:00:41,  7.09s/it] 24%|██▎       | 472/2001 [1:17:29<3:03:13,  7.19s/it] 24%|██▎       | 473/2001 [1:17:36<3:02:34,  7.17s/it] 24%|██▎       | 474/2001 [1:17:47<3:31:34,  8.31s/it] 24%|██▎       | 475/2001 [1:17:58<3:55:25,  9.26s/it] 24%|██▍       | 476/2001 [1:18:09<4:08:46,  9.79s/it] 24%|██▍       | 477/2001 [1:18:20<4:19:01, 10.20s/it] 24%|██▍       | 478/2001 [1:18:32<4:27:23, 10.53s/it] 24%|██▍       | 479/2001 [1:18:43<4:30:52, 10.68s/it] 24%|██▍       | 480/2001 [1:18:54<4:36:53, 10.92s/it] 24%|██▍       | 481/2001 [1:19:06<4:40:40, 11.08s/it] 24%|██▍       | 482/2001 [1:19:17<4:41:46, 11.13s/it] 24%|██▍       | 483/2001 [1:19:28<4:42:47, 11.18s/it] 24%|██▍       | 484/2001 [1:19:39<4:40:33, 11.10s/it] 24%|██▍       | 485/2001 [1:19:50<4:40:20, 11.10s/it] 24%|██▍       | 486/2001 [1:20:01<4:40:21, 11.10s/it] 24%|██▍       | 487/2001 [1:20:12<4:39:08, 11.06s/it] 24%|██▍       | 488/2001 [1:20:23<4:38:52, 11.06s/it] 24%|██▍       | 489/2001 [1:20:34<4:38:01, 11.03s/it] 24%|██▍       | 490/2001 [1:20:46<4:40:01, 11.12s/it] 25%|██▍       | 491/2001 [1:20:57<4:39:58, 11.12s/it] 25%|██▍       | 492/2001 [1:21:08<4:41:21, 11.19s/it] 25%|██▍       | 493/2001 [1:21:19<4:39:02, 11.10s/it] 25%|██▍       | 494/2001 [1:21:30<4:39:53, 11.14s/it] 25%|██▍       | 495/2001 [1:21:41<4:37:53, 11.07s/it] 25%|██▍       | 496/2001 [1:21:52<4:38:06, 11.09s/it] 25%|██▍       | 497/2001 [1:22:03<4:37:29, 11.07s/it] 25%|██▍       | 498/2001 [1:22:14<4:37:39, 11.08s/it] 25%|██▍       | 499/2001 [1:22:25<4:37:36, 11.09s/it] 25%|██▍       | 500/2001 [1:22:37<4:37:58, 11.11s/it] 25%|██▌       | 501/2001 [1:22:48<4:37:20, 11.09s/it] 25%|██▌       | 502/2001 [1:22:59<4:37:07, 11.09s/it] 25%|██▌       | 503/2001 [1:23:10<4:35:46, 11.05s/it] 25%|██▌       | 504/2001 [1:23:21<4:35:06, 11.03s/it] 25%|██▌       | 505/2001 [1:23:32<4:37:31, 11.13s/it] 25%|██▌       | 506/2001 [1:23:43<4:36:35, 11.10s/it] 25%|██▌       | 507/2001 [1:23:54<4:35:37, 11.07s/it] 25%|██▌       | 508/2001 [1:24:05<4:35:25, 11.07s/it] 25%|██▌       | 509/2001 [1:24:16<4:36:23, 11.11s/it] 25%|██▌       | 510/2001 [1:24:28<4:38:06, 11.19s/it] 26%|██▌       | 511/2001 [1:24:39<4:39:28, 11.25s/it] 26%|██▌       | 512/2001 [1:24:50<4:39:35, 11.27s/it] 26%|██▌       | 513/2001 [1:25:01<4:38:03, 11.21s/it]tensor(0.0678, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0691, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0754, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0714, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0669, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0721, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0844, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0693, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0719, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0792, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0684, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0704, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0693, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0672, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0697, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0664, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0655, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0650, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0707, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0626, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0801, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0701, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0632, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0623, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0634, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0783, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0759, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0693, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0847, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0781, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0646, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0705, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0636, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0695, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0634, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0691, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0645, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0673, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0620, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0665, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0630, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0636, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0615, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0629, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0634, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0652, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0736, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0614, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0584, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0684, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0654, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0672, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0614, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0638, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0624, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0626, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0753, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0586, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0744, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0617, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0641, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0651, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0608, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0621, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0685, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0586, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0604, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0615, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0591, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0563, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0564, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0581, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0624, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0604, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0588, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0558, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0583, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0887, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0615, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0741, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0708, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0730, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0609, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0591, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0600, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0601, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0670, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0738, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0585, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0644, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0596, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0628, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0626, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0660, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0642, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0561, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0579, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0676, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0604, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0565, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0586, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0669, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0565, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0589, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0619, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0600, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0592, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss  26%|██▌       | 514/2001 [1:25:12<4:36:14, 11.15s/it] 26%|██▌       | 515/2001 [1:25:23<4:32:38, 11.01s/it] 26%|██▌       | 516/2001 [1:25:34<4:31:57, 10.99s/it] 26%|██▌       | 517/2001 [1:25:45<4:33:24, 11.05s/it] 26%|██▌       | 518/2001 [1:25:56<4:32:51, 11.04s/it] 26%|██▌       | 519/2001 [1:26:08<4:34:36, 11.12s/it] 26%|██▌       | 520/2001 [1:26:18<4:28:57, 10.90s/it] 26%|██▌       | 521/2001 [1:26:29<4:30:16, 10.96s/it] 26%|██▌       | 522/2001 [1:26:40<4:31:22, 11.01s/it] 26%|██▌       | 523/2001 [1:26:51<4:30:03, 10.96s/it] 26%|██▌       | 524/2001 [1:27:02<4:30:32, 10.99s/it] 26%|██▌       | 525/2001 [1:27:13<4:31:18, 11.03s/it] 26%|██▋       | 526/2001 [1:27:24<4:31:59, 11.06s/it] 26%|██▋       | 527/2001 [1:27:36<4:32:35, 11.10s/it] 26%|██▋       | 528/2001 [1:27:46<4:30:23, 11.01s/it] 26%|██▋       | 529/2001 [1:27:58<4:30:50, 11.04s/it] 26%|██▋       | 530/2001 [1:28:09<4:32:20, 11.11s/it] 27%|██▋       | 531/2001 [1:28:20<4:33:06, 11.15s/it] 27%|██▋       | 532/2001 [1:28:31<4:32:25, 11.13s/it] 27%|██▋       | 533/2001 [1:28:42<4:32:10, 11.12s/it] 27%|██▋       | 534/2001 [1:28:53<4:32:04, 11.13s/it] 27%|██▋       | 535/2001 [1:29:04<4:29:35, 11.03s/it] 27%|██▋       | 536/2001 [1:29:15<4:29:40, 11.04s/it] 27%|██▋       | 537/2001 [1:29:26<4:29:03, 11.03s/it] 27%|██▋       | 538/2001 [1:29:37<4:27:51, 10.99s/it] 27%|██▋       | 539/2001 [1:29:48<4:25:19, 10.89s/it] 27%|██▋       | 540/2001 [1:29:59<4:26:24, 10.94s/it] 27%|██▋       | 541/2001 [1:30:10<4:26:00, 10.93s/it] 27%|██▋       | 542/2001 [1:30:21<4:26:42, 10.97s/it] 27%|██▋       | 543/2001 [1:30:31<4:23:54, 10.86s/it] 27%|██▋       | 544/2001 [1:30:42<4:22:49, 10.82s/it] 27%|██▋       | 545/2001 [1:30:53<4:23:47, 10.87s/it] 27%|██▋       | 546/2001 [1:31:04<4:24:06, 10.89s/it] 27%|██▋       | 547/2001 [1:31:15<4:24:16, 10.91s/it] 27%|██▋       | 548/2001 [1:31:26<4:26:50, 11.02s/it] 27%|██▋       | 549/2001 [1:31:37<4:27:25, 11.05s/it] 27%|██▋       | 550/2001 [1:31:49<4:28:22, 11.10s/it] 28%|██▊       | 551/2001 [1:32:00<4:29:02, 11.13s/it] 28%|██▊       | 552/2001 [1:32:11<4:28:38, 11.12s/it] 28%|██▊       | 553/2001 [1:32:22<4:27:09, 11.07s/it] 28%|██▊       | 554/2001 [1:32:33<4:27:39, 11.10s/it] 28%|██▊       | 555/2001 [1:32:44<4:26:24, 11.05s/it] 28%|██▊       | 556/2001 [1:32:55<4:27:03, 11.09s/it] 28%|██▊       | 557/2001 [1:33:06<4:27:25, 11.11s/it] 28%|██▊       | 558/2001 [1:33:18<4:27:54, 11.14s/it] 28%|██▊       | 559/2001 [1:33:29<4:26:28, 11.09s/it] 28%|██▊       | 560/2001 [1:33:39<4:25:10, 11.04s/it] 28%|██▊       | 561/2001 [1:33:50<4:25:08, 11.05s/it] 28%|██▊       | 562/2001 [1:34:02<4:25:33, 11.07s/it]../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [23,0,0], thread: [32,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [23,0,0], thread: [100,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [34,0,0], thread: [36,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [22,0,0], thread: [103,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [6,0,0], thread: [41,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [34,0,0], thread: [96,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [34,0,0], thread: [107,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [22,0,0], thread: [75,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [22,0,0], thread: [12,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [23,0,0], thread: [18,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [22,0,0], thread: [51,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [23,0,0], thread: [85,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [2,0,0], thread: [42,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [33,0,0], thread: [35,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [33,0,0], thread: [40,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [42,0,0], thread: [35,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [2,0,0], thread: [78,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [13,0,0], thread: [0,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [27,0,0], thread: [37,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [6,0,0], thread: [89,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [36,0,0], thread: [40,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [41,0,0], thread: [96,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [13,0,0], thread: [98,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [1,0,0], thread: [52,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [30,0,0], thread: [40,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [1,0,0], thread: [17,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [1,0,0], thread: [21,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [33,0,0], thread: [109,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [30,0,0], thread: [105,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [9,0,0], thread: [32,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [1,0,0], thread: [118,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [36,0,0], thread: [15,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [34,0,0], thread: [5,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [34,0,0], thread: [28,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [29,0,0], thread: [14,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [29,0,0], thread: [15,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [24,0,0], thread: [33,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [29,0,0], thread: [83,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [6,0,0], thread: [31,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [13,0,0], thread: [72,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [27,0,0], thread: [11,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [5,0,0], thread: [107,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [24,0,0], thread: [72,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [5,0,0], thread: [66,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [5,0,0], thread: [76,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [9,0,0], thread: [6,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [21,0,0], thread: [65,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [29,0,0], thread: [36,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [29,0,0], thread: [49,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [29,0,0], thread: [54,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [33,0,0], thread: [89,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [37,0,0], thread: [44,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [25,0,0], thread: [99,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [0,0,0], thread: [0,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [41,0,0], thread: [48,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [25,0,0], thread: [35,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [8,0,0], thread: [80,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [8,0,0], thread: [82,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [2,0,0], thread: [126,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [37,0,0], thread: [73,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [37,0,0], thread: [76,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [21,0,0], thread: [41,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [0,0,0], thread: [103,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [41,0,0], thread: [68,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [41,0,0], thread: [72,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [41,0,0], thread: [80,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [37,0,0], thread: [5,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [37,0,0], thread: [14,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [30,0,0], thread: [78,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [30,0,0], thread: [88,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [36,0,0], thread: [126,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [25,0,0], thread: [11,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [9,0,0], thread: [80,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [41,0,0], thread: [21,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [13,0,0], thread: [55,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [0,0,0], thread: [43,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [3,0,0], thread: [11,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [30,0,0], thread: [30,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [4,0,0], thread: [71,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [0,0,0], thread: [64,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [0,0,0], thread: [68,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [0,0,0], thread: [74,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [42,0,0], thread: [30,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [15,0,0], thread: [80,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [8,0,0], thread: [24,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [8,0,0], thread: [30,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [28,0,0], thread: [0,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [26,0,0], thread: [70,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [8,0,0], thread: [100,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [8,0,0], thread: [112,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [8,0,0], thread: [126,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [12,0,0], thread: [33,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [15,0,0], thread: [2,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [15,0,0], thread: [14,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [3,0,0], thread: [48,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [38,0,0], thread: [0,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [5,0,0], thread: [54,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [5,0,0], thread: [62,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [20,0,0], thread: [9,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [27,0,0], thread: [69,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [27,0,0], thread: [95,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [4,0,0], thread: [9,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [4,0,0], thread: [13,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [4,0,0], thread: [109,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [40,0,0], thread: [4,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [24,0,0], thread: [27,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [4,0,0], thread: [49,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [38,0,0], thread: [68,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [20,0,0], thread: [44,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [20,0,0], thread: [110,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [24,0,0], thread: [126,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [40,0,0], thread: [73,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [16,0,0], thread: [15,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [15,0,0], thread: [59,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [15,0,0], thread: [104,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [15,0,0], thread: [119,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [16,0,0], thread: [96,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [16,0,0], thread: [114,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [3,0,0], thread: [89,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [28,0,0], thread: [44,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [21,0,0], thread: [28,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [16,0,0], thread: [52,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [31,0,0], thread: [111,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [7,0,0], thread: [76,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [10,0,0], thread: [106,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [12,0,0], thread: [17,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [12,0,0], thread: [82,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [31,0,0], thread: [51,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [16,0,0], thread: [86,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [16,0,0], thread: [90,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [35,0,0], thread: [76,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [39,0,0], thread: [102,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [39,0,0], thread: [68,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [32,0,0], thread: [109,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [20,0,0], thread: [92,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [31,0,0], thread: [74,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [31,0,0], thread: [88,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [26,0,0], thread: [29,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [26,0,0], thread: [33,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [26,0,0], thread: [62,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [39,0,0], thread: [40,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [38,0,0], thread: [118,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [38,0,0], thread: [48,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [38,0,0], thread: [53,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [7,0,0], thread: [119,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [32,0,0], thread: [19,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [35,0,0], thread: [20,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [28,0,0], thread: [123,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [40,0,0], thread: [125,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [10,0,0], thread: [88,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [35,0,0], thread: [116,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [32,0,0], thread: [87,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [10,0,0], thread: [61,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [14,0,0], thread: [73,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [32,0,0], thread: [35,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [32,0,0], thread: [55,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [17,0,0], thread: [42,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [10,0,0], thread: [30,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [7,0,0], thread: [61,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [18,0,0], thread: [0,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [18,0,0], thread: [2,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [7,0,0], thread: [18,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [7,0,0], thread: [30,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [35,0,0], thread: [62,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [19,0,0], thread: [6,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [19,0,0], thread: [18,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [18,0,0], thread: [104,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [39,0,0], thread: [21,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [17,0,0], thread: [115,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [11,0,0], thread: [16,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [11,0,0], thread: [20,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [11,0,0], thread: [23,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [18,0,0], thread: [74,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [19,0,0], thread: [45,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [19,0,0], thread: [52,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [11,0,0], thread: [124,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [11,0,0], thread: [61,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [17,0,0], thread: [76,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [17,0,0], thread: [83,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [17,0,0], thread: [23,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [11,0,0], thread: [78,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [11,0,0], thread: [94,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [14,0,0], thread: [57,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [18,0,0], thread: [50,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+../aten/src/ATen/native/cuda/Loss.cu:94: operator(): block: [18,0,0], thread: [60,0,0] Assertion `input_val >= zero && input_val <= one` failed.
+ 28%|██▊       | 562/2001 [1:34:04<4:00:52, 10.04s/it]
+tensor(0.0575, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0624, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0598, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0514, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0545, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0561, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0569, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0536, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0537, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0589, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0698, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0565, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0539, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0547, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0568, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0579, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0547, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0546, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0529, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0635, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0615, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0568, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0553, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0541, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0574, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0585, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0562, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0556, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0564, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0565, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0521, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0568, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0525, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0554, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0561, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0580, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0539, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0538, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0532, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1121, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0598, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.0917, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1118, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1344, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1021, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.5388, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1099, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.2335, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+loss tensor(0.1487, device='cuda:0', grad_fn=<BinaryCrossEntropyBackward0>)
+NaN values found in the forward output y!
+Traceback (most recent call last):
+  File "sbgnn.py", line 490, in <module>
+    main()
+  File "sbgnn.py", line 487, in main
+    run()
+  File "sbgnn.py", line 445, in run
+    loss = model.loss(pred_y, train_y)
+  File "sbgnn.py", line 293, in loss
+    return F.binary_cross_entropy(pred_y, y, weight=weight)
+  File "/home/yrgu/miniconda3/envs/experiment/lib/python3.8/site-packages/torch/nn/functional.py", line 3122, in binary_cross_entropy
+    return torch._C._nn.binary_cross_entropy(input, target, weight, reduction_enum)
+RuntimeError: CUDA error: device-side assert triggered
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+

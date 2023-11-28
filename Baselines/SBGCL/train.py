@@ -30,7 +30,7 @@ parser.add_argument('--debug', action='store_true', default=False,
                     help='debug mode')
 parser.add_argument('--no-cuda', action='store_true', default=False,
                     help='Disables CUDA training.')
-parser.add_argument('--dataset', type=str, default='review-1',
+parser.add_argument('--dataset', type=str, default='bitcoin_alpha-1',
                     help='choose dataset')
 parser.add_argument('--seed', type=int, default=2023,
                     help='Random seed.')
@@ -54,7 +54,7 @@ parser.add_argument('--lr', type=float, default=0.005,
                     help='Initial learning rate.')
 parser.add_argument('--dim_embs', type=int, default=32,
                     help='initial embedding size of node')
-parser.add_argument('--epochs', type=int, default=300,
+parser.add_argument('--epochs', type=int, default=2000,
                     help='initial embedding size of node')
 
 
@@ -72,12 +72,13 @@ setup_seed(args.seed) # 设置随机数种子，默认2023
 
 dataset = args.dataset
 
-train_edgelist, val_edgelist, test_edgelist = load_data(dataset) # numpy.array [edges_n, 3]
+train_edgelist, train_labels, val_edgelist, val_labels, test_edgelist, test_labels = load_data(dataset) # numpy.array [edges_n, 3]
 
 edges = np.concatenate((train_edgelist, val_edgelist, test_edgelist), axis=0)
 num_a = edges[:, 0].max() - edges[:, 0].min() + 1
 num_b = edges[:, 1].max() - edges[:, 1].min() + 1
 
+# 让u、v节点索引不重叠
 train_edgelist[:, 1] = train_edgelist[:, 1] + num_a
 val_edgelist[:, 1] = val_edgelist[:, 1] + num_a
 test_edgelist[:, 1] = test_edgelist[:, 1] + num_a
@@ -165,15 +166,18 @@ cnt = 0
 
 uids_train = torch.cat([train_pos_edges[0], train_neg_edges[0]]).long().to(device)
 vids_train = torch.cat([train_pos_edges[1], train_neg_edges[1]]).long().to(device)
-y_label_train = torch.cat([torch.ones(train_pos_edges.shape[1]), torch.zeros(train_neg_edges.shape[1])]).to(device)
+# y_label_train = torch.cat([torch.ones(train_pos_edges.shape[1]), torch.zeros(train_neg_edges.shape[1])]).to(device)
+y_label_train = torch.from_numpy(train_labels).float().to(device)
 
 uids_val = torch.cat([val_pos_edges[0], val_neg_edges[0]]).long().to(device)
 vids_val = torch.cat([val_pos_edges[1], val_neg_edges[1]]).long().to(device)
-y_label_val = torch.cat([torch.ones(val_pos_edges.shape[1]), torch.zeros(val_neg_edges.shape[1])]).to(device)
+# y_label_val = torch.cat([torch.ones(val_pos_edges.shape[1]), torch.zeros(val_neg_edges.shape[1])]).to(device)
+y_label_val = torch.from_numpy(val_labels).float().to(device)
 
 uids_test = torch.cat([test_pos_edges[0], test_neg_edges[0]]).long().to(device)
 vids_test = torch.cat([test_pos_edges[1], test_neg_edges[1]]).long().to(device)
-y_label_test = torch.cat([torch.ones(test_pos_edges.shape[1]), torch.zeros(test_neg_edges.shape[1])]).to(device)
+# y_label_test = torch.cat([torch.ones(test_pos_edges.shape[1]), torch.zeros(test_neg_edges.shape[1])]).to(device)
+y_label_test = torch.from_numpy(test_labels).float().to(device)
 
 
 
