@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch_geometric.nn import GATConv
-from sklearn.metrics import f1_score, roc_auc_score, precision_score, recall_score
+from sklearn.metrics import f1_score, roc_auc_score, precision_score, recall_score, accuracy_score
 
 class SBGRL(nn.Module):
     def __init__(self, args, num_a, num_b, emb_size_a=32, emb_size_b=32, layer_num=2):
@@ -497,6 +497,7 @@ def test_and_val(pred_y, y, mode='val', epoch=0):
     f1 = f1_score(test_y, preds)
     precision = precision_score(test_y,preds)
     recall = recall_score(test_y, preds)
+    acc = accuracy_score(test_y,preds)
     macro_f1 = f1_score(test_y, preds, average='macro')
     micro_f1 = f1_score(test_y, preds, average='micro')
     pos_ratio = np.sum(test_y) /  len(test_y)
@@ -504,6 +505,7 @@ def test_and_val(pred_y, y, mode='val', epoch=0):
         f'{mode}_auc': auc,
         f'{mode}_precision' : precision,
         f'{mode}_recall' : recall,
+        f'{mode}_acc': acc,
         f'{mode}_f1' : f1,
         f'{mode}_pos_ratio': pos_ratio,
         f'{mode}_epoch': epoch,

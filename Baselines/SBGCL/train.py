@@ -22,7 +22,7 @@ def setup_seed(seed):
     # torch.backends.cudnn.benchmark = False
     # torch.backends.cudnn.deterministic = True
     torch.use_deterministic_algorithms(True)
-    
+
 
 parser = argparse.ArgumentParser()
 
@@ -62,7 +62,7 @@ args = parser.parse_args()
 print(args)
 
 args.cuda = not args.no_cuda and torch.cuda.is_available()
-device = torch.device("cuda:0" if args.cuda else "cpu")
+device = torch.device("cuda:1" if args.cuda else "cpu")
 # device = torch.device("cpu")
 
 # torch.set_default_dtype(torch.float32)
@@ -228,7 +228,7 @@ for epoch in range(args.epochs):
 
 
 print('Done! Best Results:')
-print_list = ['test_auc', 'test_f1', 'test_macro_f1', 'test_micro_f1']
+print_list = ['test_auc', 'test_precision', 'test_recall', 'test_acc','test_f1', 'test_macro_f1', 'test_micro_f1']
 for i in print_list:
     print(i, res_best[i], end=' ')
 

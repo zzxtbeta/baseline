@@ -1,55 +1,107 @@
-# node2vec
+# Node2Vec
+[![Downloads](http://pepy.tech/badge/node2vec)](http://pepy.tech/project/node2vec)
 
-This repository provides a reference implementation of *node2vec* as described in the paper:<br>
-> node2vec: Scalable Feature Learning for Networks.<br>
-> Aditya Grover and Jure Leskovec.<br>
-> Knowledge Discovery and Data Mining, 2016.<br>
-> <Insert paper link>
+Python3 implementation of the node2vec algorithm Aditya Grover, Jure Leskovec and Vid Kocijan.
+[node2vec: Scalable Feature Learning for Networks. A. Grover, J. Leskovec. ACM SIGKDD International Conference on Knowledge Discovery and Data Mining (KDD), 2016.](https://snap.stanford.edu/node2vec/)
 
-The *node2vec* algorithm learns continuous representations for nodes in any (un)directed, (un)weighted graph. Please check the [project page](https://snap.stanford.edu/node2vec/) for more details. 
+# Maintenance
 
-### Basic Usage
+### I no longer have time to maintain this, if someone wants to pick the baton let me know
 
-#### Example
-To run *node2vec* on Zachary's karate club network, execute the following command from the project home directory:<br/>
-	``python src/main.py --input graph/karate.edgelist --output emb/karate.emd``
+## Installation
 
-#### Options
-You can check out the other options available to use with *node2vec* using:<br/>
-	``python src/main.py --help``
+`pip install node2vec`
 
-#### Input
-The supported input format is an edgelist:
+## Usage
+```python
+import networkx as nx
+from node2vec import Node2Vec
 
-	node1_id_int node2_id_int <weight_float, optional>
-		
-The graph is assumed to be undirected and unweighted by default. These options can be changed by setting the appropriate flags.
+# Create a graph
+graph = nx.fast_gnp_random_graph(n=100, p=0.5)
 
-#### Output
-The output file has *n+1* lines for a graph with *n* vertices. 
-The first line has the following format:
+# Precompute probabilities and generate walks - **ON WINDOWS ONLY WORKS WITH workers=1**
+node2vec = Node2Vec(graph, dimensions=64, walk_length=30, num_walks=200, workers=4)  # Use temp_folder for big graphs
 
-	num_of_nodes dim_of_representation
+# Embed nodes
+model = node2vec.fit(window=10, min_count=1, batch_words=4)  # Any keywords acceptable by gensim.Word2Vec can be passed, `dimensions` and `workers` are automatically passed (from the Node2Vec constructor)
 
-The next *n* lines are as follows:
-	
-	node_id dim1 dim2 ... dimd
+# Look for most similar nodes
+model.wv.most_similar('2')  # Output node names are always strings
 
-where dim1, ... , dimd is the *d*-dimensional representation learned by *node2vec*.
+# Save embeddings for later use
+model.wv.save_word2vec_format(EMBEDDING_FILENAME)
 
-### Citing
-If you find *node2vec* useful for your research, please consider citing the following paper:
+# Save model for later use
+model.save(EMBEDDING_MODEL_FILENAME)
 
-	@inproceedings{node2vec-kdd2016,
-	author = {Grover, Aditya and Leskovec, Jure},
-	 title = {node2vec: Scalable Feature Learning for Networks},
-	 booktitle = {Proceedings of the 22nd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining},
-	 year = {2016}
-	}
+# Embed edges using Hadamard method
+from node2vec.edges import HadamardEmbedder
 
+edges_embs = HadamardEmbedder(keyed_vectors=model.wv)
 
-### Miscellaneous
+# Look for embeddings on the fly - here we pass normal tuples
+edges_embs[('1', '2')]
+''' OUTPUT
+array([ 5.75068220e-03, -1.10937878e-02,  3.76693785e-01,  2.69105062e-02,
+       ... ... ....
+       ..................................................................],
+      dtype=float32)
+'''
 
-Please send any questions you might have about the code and/or the algorithm to <adityag@cs.stanford.edu>.
+# Get all edges in a separate KeyedVectors instance - use with caution could be huge for big networks
+edges_kv = edges_embs.as_keyed_vectors()
 
-*Note:* This is only a reference implementation of the *node2vec* algorithm and could benefit from several performance enhancement schemes, some of which are discussed in the paper.
+# Look for most similar edges - this time tuples must be sorted and as str
+edges_kv.most_similar(str(('1', '2')))
+
+# Save embeddings for later use
+edges_kv.save_word2vec_format(EDGES_EMBEDDING_FILENAME)
+
+```
+
+### Parameters
+
+#### `node2vec.Node2vec`
+
+- `Node2Vec` constructor:
+    1. `graph`: The first positional argument has to be a networkx graph. Node names must be all integers or all strings. On the output model they will always be strings.
+    2. `dimensions`: Embedding dimensions (default: 128)
+    3. `walk_length`: Number of nodes in each walk (default: 80)
+    4. `num_walks`: Number of walks per node (default: 10)
+    5. `p`: Return hyper parameter (default: 1)
+    6. `q`: Inout parameter (default: 1)
+    7. `weight_key`: On weighted graphs, this is the key for the weight attribute (default: 'weight')
+    8. `workers`: Number of workers for parallel execution (default: 1)
+    9. `sampling_strategy`: Node specific sampling strategies, supports setting node specific 'q', 'p', 'num_walks' and 'walk_length'.
+        Use these keys exactly. If not set, will use the global ones which were passed on the object initialization`
+    10. `quiet`: Boolean controlling the verbosity. (default: False)
+    11. `temp_folder`: String path pointing to folder to save a shared memory copy of the graph - Supply when working on graphs that are too big to fit in memory during algorithm execution.
+    12. `seed`: Seed for the random number generator (default: None). Deterministic results can be obtained if seed is set and `workers=1`.
+
+- `Node2Vec.fit` method:
+    Accepts any key word argument acceptable by gensim.Word2Vec
+
+#### `node2vec.EdgeEmbedder`
+
+`EdgeEmbedder` is an abstract class which all the concrete edge embeddings class inherit from.
+The classes are `AverageEmbedder`, `HadamardEmbedder`, `WeightedL1Embedder` and `WeightedL2Embedder` which their practical definition could be found in the [paper](https://arxiv.org/pdf/1607.00653.pdf) on table 1
+Notice that edge embeddings are defined for any pair of nodes, connected or not and even node with itself.
+
+- Constructor:
+    1. `keyed_vectors`: A gensim.models.KeyedVectors instance containing the node embeddings
+    2. `quiet`: Boolean controlling the verbosity. (default: False)
+
+- `EdgeEmbedder.__getitem__(item)` method, better known as `EdgeEmbedder[item]`:
+    1. `item` - A tuple consisting of 2 nodes from the `keyed_vectors` passed in the constructor. Will return the embedding of the edge.
+
+- `EdgeEmbedder.as_keyed_vectors` method: Returns a `gensim.models.KeyedVectors` instance with all possible node pairs in a *sorted* manner as string.
+  For example, for nodes ['1', '2', '3'] we will have as keys "('1', '1')", "('1', '2')", "('1', '3')", "('2', '2')", "('2', '3')" and "('3', '3')".
+
+## Caveats
+- Node names in the input graph must be all strings, or all ints
+- Parallel execution not working on Windows (`joblib` known issue). To run non-parallel on Windows pass `workers=1` on the `Node2Vec`'s constructor
+
+## TODO
+- [x] Parallel implementation for walk generation
+- [ ] Parallel implementation for probability precomputation

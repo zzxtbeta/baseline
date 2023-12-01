@@ -3,8 +3,8 @@ DATA_EMB_DIC1 = {
     'house1to10': (515, 1281),
     'senate1to10': (145, 1056),
     'review': (182, 304),
-    'bitcoin_alpha': (3783, 3783),
-    'bitcoin_otc': (5858, 5858)
+    'bitcoin_alpha': (3286, 3754),
+    'bitcoin_otc': (4814, 5858)
 }
 
 DATA_EMB_DIC = {**DATA_EMB_DIC1}

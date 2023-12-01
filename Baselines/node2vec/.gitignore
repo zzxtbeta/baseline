@@ -1,14 +1,10 @@
+# Compiled python modules.
 *.pyc
-.DS_Store
-target
-bin
-build
-.gradle
-*.iml
-*.ipr
-*.iws
-*.log
-.classpath
-.project
-.settings
+
+# Setuptools distribution folder.
+/dist/
+
+# Python egg metadata, regenerated from source files by setuptools.
+/*.egg-info
+
 .idea

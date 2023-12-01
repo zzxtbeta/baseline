@@ -1,0 +1,9 @@
+Data(x=[3783, 3783], edge_index=[2, 25826], y=[25826], train_mask=[25826], val_mask=[25826], test_mask=[25826])
+data.train_mask shape: torch.Size([25826])
+out shape: torch.Size([3783, 2])
+Traceback (most recent call last):
+  File "GAT_modify.py", line 159, in <module>
+    loss = train()
+  File "GAT_modify.py", line 127, in train
+    loss = F.cross_entropy(out[data.train_mask], torch.tensor(data.y[data.train_mask], dtype=torch.long))
+IndexError: The shape of the mask [25826] at index 0 does not match the shape of the indexed tensor [3783, 2] at index 0
