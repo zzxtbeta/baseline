@@ -15,10 +15,11 @@ def get_data():
     root_path, _ = os.path.split(os.path.abspath(__file__))
 
     train_data = pd.read_csv(root_path+'/datasets/bitcoin/bitcoin_alpha-1_training.txt', names=['u', 'i', 'l', 'k'], delimiter='\t', dtype=int)
+    val_data = pd.read_csv(root_path+'/datasets/bitcoin/bitcoin_alpha-1_validation.txt', names=['u', 'i', 'l', 'k'], delimiter='\t', dtype=int)
     test_data = pd.read_csv(root_path+'/datasets/bitcoin/bitcoin_alpha-1_testing.txt', names=['u', 'i','l', 'k'], delimiter='\t', dtype=int)
 
 
-    df = pd.concat((train_data, test_data))
+    df = pd.concat((train_data, val_data, test_data))
 
     dataset = Dataset()
 
@@ -31,23 +32,20 @@ def get_data():
 
     dataset.train_edge = torch.LongTensor(np.array(train_data[['u', 'i', 'l','k']]))
 
+    dataset.val_edge = torch.LongTensor(np.array(val_data[['u', 'i', 'l','k']]))
+
     dataset.test_edge = torch.LongTensor(np.array(test_data[['u', 'i', 'l', 'k']]))
 
-    # dataset.edge_label = torch.LongTensor(np.array(df[['l']]))
-
-    # dataset.attack_label = torch.LongTensor(np.array(df[['k']]))
-
-    # dataset.train_u = list(set(train_data['u']))
-    # dataset.train_u.sort()
-    # dataset.train_u = torch.LongTensor(dataset.train_u)
-
-
-    # dataset.test_u = list(set(test_data['u']))
-    # dataset.test_u.sort()
-    # dataset.test_u = torch.LongTensor(dataset.test_u)
+    dataset.train_u = list(set(train_data['u']))
+    dataset.train_u.sort()
+    dataset.train_u = torch.LongTensor(dataset.train_u)
 
     dataset.u_x = torch.FloatTensor(np.load(root_path+'/datasets/node_feature_div/alpha_u_feature.npy'))
     dataset.i_x = torch.FloatTensor(np.load(root_path+'/datasets/node_feature_div/alpha_v_feature.npy'))
+
+
+    x = torch.cat([dataset.u_x, dataset.i_x], dim=0)
+    dataset.x = torch.FloatTensor(x)
 
     return dataset
 
@@ -94,7 +92,30 @@ def get_abcore(dataset, device):
         if result_u[node1] and result_i[node2]:
             selected_edges.append(edge.tolist())
     dataset.train_edge = torch.LongTensor(np.array(selected_edges))
-    print(dataset.train_edge.shape)
+    dataset.train_edge = dataset.train_edge.to(device)
+    dataset.train_edge_label = dataset.train_edge[:,2].to(device)
+    dataset.train_edge_attack = dataset.train_edge[:,3].to(device)
+    dataset.train_edge_index = dataset.train_edge[:,0:2].T.to(device)
+    dataset.u_atk_idx = torch.unique(dataset.train_edge[dataset.train_edge[:,3] == 1,0]).to(device)
+    # print(torch.unique(dataset.train_edge[:,0]))
+    # print(dataset.train_edge_index.shape)
+
+
+    # 更新val_edge
+    selected_edges = []
+    for edge in dataset.val_edge:
+        # print(f"edge: {edge}")
+        node1, node2 = edge[0].item(), edge[1].item()
+        # print(node1, node2)
+        if result_u[node1] and result_i[node2]:
+            selected_edges.append(edge.tolist())
+    dataset.val_edge = torch.LongTensor(np.array(selected_edges))
+    dataset.val_edge = dataset.val_edge.to(device)
+    dataset.val_edge_label = dataset.val_edge[:,2].to(device)
+    dataset.val_edge_attack = dataset.val_edge[:,3].to(device)
+    dataset.val_edge_index = dataset.val_edge[:,0:2].T.to(device)
+    # print(dataset.val_edge.shape)
+
 
     # 更新test_edge
     selected_edges = []
@@ -105,22 +126,11 @@ def get_abcore(dataset, device):
         if result_u[node1] and result_i[node2]:
             selected_edges.append(edge.tolist())
     dataset.test_edge = torch.LongTensor(np.array(selected_edges))
-    print(dataset.test_edge.shape)
-
-
-
-    # print("Updated Dimensions:")
-    # print(f"all_edge: {dataset.all_edge.shape}")
-    # print(f"train_edge: {dataset.train_edge.shape}")
-    # print(f"test_edge: {dataset.test_edge.shape}")
-    # print(f"edge_label: {dataset.edge_label.shape}")
-    # print(f"attack_label: {dataset.attack_label.shape}")
-    # print(f"train_u: {dataset.train_u.shape}")
-    # print(f"test_u: {dataset.test_u.shape}")
-    # print(f"u_x: {dataset.u_x.shape}")
-    # print(f"i_x: {dataset.i_x.shape}")
-
-
+    dataset.test_edge = dataset.test_edge.to(device)
+    dataset.test_edge_label = dataset.test_edge[:,2].to(device)
+    dataset.test_edge_attack = dataset.test_edge[:,3].to(device)
+    dataset.test_edge_index = dataset.test_edge[:,0:2].T.to(device)
+    # print(dataset.test_edge.shape)
 
     return dataset
 
