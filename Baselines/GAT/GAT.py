@@ -26,7 +26,8 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 path = osp.join(osp.dirname(osp.realpath(__file__)), 'data', 'Planetoid')
 dataset = Planetoid(path, args.dataset, transform=T.NormalizeFeatures())
 data = dataset[0].to(device)
-print(data)
+print(f"data.edge_attrs: {data.edge_attrs}")
+
 
 
 class GAT(torch.nn.Module):

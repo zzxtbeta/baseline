@@ -78,12 +78,41 @@ class GraphSAGE(nn.Module):
         x_i = self.conv2(x_i, edge_index)
 
         return x_u, x_i
+    
+class GCN_1(torch.nn.Module):
+    def __init__(self, in_dim, hidden_dim, out_dim):
+        super().__init__()
+        self.conv1 = GCNConv(in_dim, hidden_dim,)
+        self.conv2 = GCNConv(hidden_dim, out_dim)
+
+    def forward(self, x, edge_index, edge_weight):
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = self.conv1(x, edge_index, edge_weight).relu()
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = self.conv2(x, edge_index, edge_weight)
+        return x   
+    
+class GCN_2(torch.nn.Module):
+    def __init__(self, in_dim, hidden_dim, out_dim):
+        super().__init__()
+        self.conv1 = GCNConv(in_dim, hidden_dim,)
+        self.conv2 = GCNConv(hidden_dim, out_dim)
+
+    def forward(self, x, edge_index, edge_weight):
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = self.conv1(x, edge_index, edge_weight).relu()
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = self.conv2(x, edge_index, edge_weight)
+        return x 
 
 
 class GNN(nn.Module):
     def __init__(self, u_x_dim, i_x_dim, n_clusters, hidden_dim, hidden_layer, dataset):
         super(GNN, self).__init__()
         self.sage = GraphSAGE((u_x_dim, i_x_dim), hidden_dim, u_x_dim)
+        self.gcn_1 = GCN_1(u_x_dim, hidden_dim, u_x_dim)
+        self.gcn_2 = GCN_2(i_x_dim, hidden_dim, i_x_dim)
+
         self.cluster_layer = Parameter(torch.Tensor(n_clusters, u_x_dim + i_x_dim))
         torch.nn.init.xavier_normal_(self.cluster_layer.data)
 
@@ -107,25 +136,31 @@ def run(dataset):
     print(args)
 
     optimizer = Adam(model.parameters(), lr=args.lr)
-    max_node_num = max(dataset.max_u, dataset.max_i)
-    min_node_num = min(dataset.max_u, dataset.max_i)
 
-    # A
-    sparse_matrix_max_1 = SparseTensor(row=dataset.train_edge_index[0], col=dataset.train_edge_index[1], value=dataset.train_edge_label, sparse_sizes=(max_node_num, max_node_num))
-    sparse_matrix_min_1 = SparseTensor(row=dataset.train_edge_index[0], col=dataset.train_edge_index[1], value=dataset.train_edge_label, sparse_sizes=(min_node_num, min_node_num))
-    # A2
-    sparse_matrix_max_2 = SparseTensor(row=dataset.train_edge_index[0], col=dataset.train_edge_index[1], value=torch.where(dataset.train_edge_label == -1, torch.tensor(1), dataset.train_edge_label), sparse_sizes=(max_node_num, max_node_num))
-    sparse_matrix_min_2 = SparseTensor(row=dataset.train_edge_index[0], col=dataset.train_edge_index[1], value=torch.where(dataset.train_edge_label == -1, torch.tensor(1), dataset.train_edge_label), sparse_sizes=(min_node_num, min_node_num))
+    # max_node_num = max(dataset.max_u, dataset.max_i)
+    # min_node_num = min(dataset.max_u, dataset.max_i)
 
-    # print(sparse_matrix_max_2)
-    # print(sparse_matrix_max_2.sizes())
-    # print(sparse_matrix_max_2.to_dense())
+    # # A edg
+    # sparse_matrix_max_1 = SparseTensor(row=dataset.train_edge_index[0], col=dataset.train_edge_index[1], value=dataset.train_edge_label, sparse_sizes=(max_node_num, max_node_num))
+    # sparse_matrix_min_1 = SparseTensor(row=dataset.train_edge_index[0], col=dataset.train_edge_index[1], value=dataset.train_edge_label, sparse_sizes=(min_node_num, min_node_num))
+    # # A2
+    # sparse_matrix_max_2 = SparseTensor(row=dataset.train_edge_index[0], col=dataset.train_edge_index[1], value=torch.where(dataset.train_edge_label == -1, torch.tensor(1), dataset.train_edge_label), sparse_sizes=(max_node_num, max_node_num))
+    # sparse_matrix_min_2 = SparseTensor(row=dataset.train_edge_index[0], col=dataset.train_edge_index[1], value=torch.where(dataset.train_edge_label == -1, torch.tensor(1), dataset.train_edge_label), sparse_sizes=(min_node_num, min_node_num))
 
-    # AWX
-    u_x_a, i_x_a = model.sage((dataset.u_x, dataset.i_x), sparse_matrix_max_1, sparse_matrix_min_1) # [3286,64]  [3754,64]
+    # # print(sparse_matrix_max_2)
+    # # print(sparse_matrix_max_2.sizes())
+    # # print(sparse_matrix_max_2.to_dense())
 
-    # A2WX
-    u_x_a2, i_x_a2 = model.sage((dataset.u_x, dataset.i_x), sparse_matrix_max_2, sparse_matrix_min_2) # [3286,64]  [3754,64]
+    # # AWX
+    # u_x_a, i_x_a = model.sage((dataset.u_x, dataset.i_x), sparse_matrix_max_1, sparse_matrix_min_1) # [3286,64]  [3754,64]
+    u_x_a= model.gcn_1(dataset.u_x, dataset.train_edge_index, dataset.train_edge_label.float())
+    i_x_a= model.gcn_1(dataset.i_x, dataset.train_edge_index, dataset.train_edge_label.float())
+
+    # # A2WX
+
+    # u_x_a2, i_x_a2 = model.sage((dataset.u_x, dataset.i_x), sparse_matrix_max_2, sparse_matrix_min_2) # [3286,64]  [3754,64]+
+    u_x_a2 = model.gcn_2(dataset.u_x, dataset.train_edge_index, dataset.train_edge_label.float())
+    i_x_a2 = model.gcn_2(dataset.i_x, dataset.train_edge_index, dataset.train_edge_label.float())
 
     # 拼接得到用户特征
     u_emb = torch.cat((u_x_a, u_x_a2), dim=1)
@@ -140,35 +175,35 @@ def run(dataset):
     # n_id：L层采样中遇到的所有的节点的list，其中target节点在list最前端；
     # adjs：第L层到第1层采样结果的list, 包含(edge_index, e_id, size)
     """
-    train_loader = NeighborSampler(dataset.train_edge, sizes=[-1], batch_size=5000, num_workers=6, shuffle=True)
-    # val_loader = NeighborSampler(dataset.val_edge, sizes=[-1], batch_size=5000, num_workers=6,shuffle=False)
-    test_loader = NeighborSampler(dataset.test_edge, sizes=[-1], batch_size=5000, num_workers=6, shuffle=False)
-    assert len(test_loader) == 1
-    batch_num = len(train_loader)
-
-    with torch.no_grad():
-        # 寻找Top k个离攻击者社区最远的用户社区
-        normal_u_cluster = kmeans(u_emb, u_atk_emb, args.n_clusters, args.k)
-        # model.cluster_layer.data = kmeans(u_emb, u_atk_emb, args.n_clusters, args.k).to(device)
-        for i, cluster_nodes in enumerate(normal_u_cluster):
-            print(f"Cluster {i + 1} nodes shape:", cluster_nodes)
-            print(f"Cluster {i + 1} nodes size:", cluster_nodes.size(0))
-
-        # k个正常用户社区节点embedding
-        normal_u_emb = [u_emb[cluster_nodes] for cluster_nodes in normal_u_cluster]
-        normal_u_emb = torch.cat(normal_u_emb, dim=0)
-        print("normal_u_emb shape:", normal_u_emb.shape)
-        print("normal_u_emb size:", normal_u_emb)
+    # train_loader = NeighborSampler(dataset.train_edge, sizes=[-1], batch_size=5000, num_workers=6, shuffle=True)
+    # # val_loader = NeighborSampler(dataset.val_edge, sizes=[-1], batch_size=5000, num_workers=6,shuffle=False)
+    # test_loader = NeighborSampler(dataset.test_edge, sizes=[-1], batch_size=5000, num_workers=6, shuffle=False)
+    # assert len(test_loader) == 1
+    # batch_num = len(train_loader)
 
 
-        torch.cuda.empty_cache()
-        max_train_f1 = 0
-        max_test_f1 = 0
-        max_test_acc = 0
-        max_test_pre = 0
-        max_test_recall = 0
-        max_test_auc = 0
-        max_epoch = 0
+    # 寻找Top k个离攻击者社区最远的用户社区
+    normal_u_cluster = kmeans(u_emb, u_atk_emb, args.n_clusters, args.k)
+    # model.cluster_layer.data = kmeans(u_emb, u_atk_emb, args.n_clusters, args.k).to(device)
+    for i, cluster_nodes in enumerate(normal_u_cluster):
+        print(f"Cluster {i + 1} nodes shape:", cluster_nodes)
+        print(f"Cluster {i + 1} nodes size:", cluster_nodes.size(0))
+
+    # k个正常用户社区节点embedding
+    normal_u_emb = [u_emb[cluster_nodes] for cluster_nodes in normal_u_cluster]
+    normal_u_emb = torch.cat(normal_u_emb, dim=0)
+    print("normal_u_emb shape:", normal_u_emb.shape)
+    print("normal_u_emb size:", normal_u_emb)
+
+
+    # torch.cuda.empty_cache()
+    # max_train_f1 = 0
+    # max_test_f1 = 0
+    # max_test_acc = 0
+    # max_test_pre = 0
+    # max_test_recall = 0
+    # max_test_auc = 0
+    # max_epoch = 0
 
     # for batch_size, n_id, adjs in test_loader:
     #     test_init_data = init_data(adjs, n_id, train=False)
@@ -218,6 +253,7 @@ if __name__ == '__main__':
     setup_seed(args.seed)
     # setup device
     device = torch.device(args.device)
+    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # get dataset
     dataset = ab.get_abcore_data(device)
 
