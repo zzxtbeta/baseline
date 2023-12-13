@@ -5,7 +5,7 @@ from torch.autograd import Variable
 
 class FocalLoss(nn.Module):
     r"""
-        This criterion is a implemenation of Focal Loss, which is proposed in 
+        This criterion is a implemenation of Focal Loss, which is proposed in
         Focal Loss for Dense Object Detection.
 
             Loss(x, class) = - \alpha (1-softmax(x)[class])^gamma \log(softmax(x)[class])
@@ -14,7 +14,7 @@ class FocalLoss(nn.Module):
 
         Args:
             alpha(1D Tensor, Variable) : the scalar factor for this criterion
-            gamma(float, double) : gamma > 0; reduces the relative loss for well-classiﬁed examples (p > .5), 
+            gamma(float, double) : gamma > 0; reduces the relative loss for well-classiﬁed examples (p > .5),
                                    putting more focus on hard, misclassiﬁed examples
             size_average(bool): By default, the losses are averaged over observations for each minibatch.
                                 However, if the field size_average is set to False, the losses are
@@ -58,7 +58,7 @@ class FocalLoss(nn.Module):
         #print('probs size= {}'.format(probs.size()))
         #print(probs)
 
-        batch_loss = -alpha*(torch.pow((1-probs), self.gamma))*log_p 
+        batch_loss = -alpha*(torch.pow((1-probs), self.gamma))*log_p
         #print('-----bacth_loss------')
         #print(batch_loss)
 

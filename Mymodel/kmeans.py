@@ -1,6 +1,6 @@
 import torch
 
-def kmeans(x, attacker, ncluster, k, niter=10):
+def kmeans(x, attacker, ncluster, k, niter=20):
     '''
     x : torch.tensor(data_num,data_dim)
     attacker_center : torch.tensor(num_attackers, data_dim)
@@ -10,6 +10,7 @@ def kmeans(x, attacker, ncluster, k, niter=10):
     '''
 
     N, D = x.size()
+
     c = x[torch.randperm(N)[:ncluster]] # init clusters at random
     for i in range(niter):
         a = ((x[:, None, :] - c[None, :, :])**2).sum(-1).argmin(1)
